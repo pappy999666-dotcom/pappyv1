@@ -1,0 +1,6764 @@
+// core/telegram.js
+// 🌐 SAAS DASHBOARD: Enterprise API 9.4 Colored UI & Universal Bridge
+
+'use strict';
+const { Telegraf, session } = require('telegraf');
+const fsp  = require('fs').promises;
+const fs   = require('fs');
+const path = require('path');
+const os   = require('os');
+const axios = require('axios');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const { createCommandRegistry } = require('./telegram/commandRegistry');
+const { createTelegramRBAC } = require('./telegram/rbac');
+const { buildLinkPreview } = require('./linkPreview');
+const menuSongManager = require('../modules/menuSongManager');
+
+const { tgBotToken, ownerTelegramId } = require('../config');
+const ownerManager = require('../modules/ownerManager');
+const pairingRegistry = require('../modules/pairingRegistry');
+const { startWhatsApp, activeSockets, botState, saveState } = require('./whatsapp');
+const logger      = require('./logger');
+const taskManager = require('./taskManager');
+const Intel       = require('./models/Intel');
+const { isRadarEnabled, setRadarEnabled } = require('./radarControl');
+// Fix: static imports — eliminates all dynamic require(variable) for bullEngine
+const { broadcastQueue } = require('./bullEngine');
+// Fix: static import for groupstatus plugin — eliminates getGsPlugin() dynamic require
+const gsPlugin = (() => { try { return require('../plugins/pappy-groupstatus'); } catch (e) { logger.warn('GroupStatus plugin not loaded'); return null; } })();
+const stickerPackManager = require('../modules/stickerPackManager');
+
+const SESSIONS_PATH = path.join(__dirname, '../data/sessions');
+const PLUGINS_DIR   = path.resolve(__dirname, '../plugins');
+const TELEGRAM_COMMANDS_DIR = path.resolve(__dirname, './telegram/commands');
+const TG_AUTO_URL_FILE = path.join(__dirname, '../data/telegram-auto-url.json');
+const TG_AUTO_DL_FILE   = path.join(__dirname, '../data/telegram-auto-dl.json');
+const TG_MUSIC_DL_FILE  = path.join(__dirname, '../data/telegram-music-dl.json');
+const TG_GROUP_PROTECT_FILE = path.join(__dirname, '../data/telegram-group-protect.json');
+const TG_AI_MODE_FILE   = path.join(__dirname, '../data/telegram-ai-mode.json');
+const TG_NODE_AI_PROMPT_FILE = path.join(__dirname, '../data/telegram-node-ai-prompts.json');
+const TG_NODE_AI_API_FILE = path.join(__dirname, '../data/telegram-node-ai-api.json');
+const TG_GLOBAL_AI_SETTINGS_FILE = path.join(__dirname, '../data/telegram-global-ai-settings.json');
+const TG_AI_VIBE_FILE = path.join(__dirname, '../data/telegram-ai-vibe.json');
+const TG_AI_STICKER_CACHE_FILE = path.join(__dirname, '../data/telegram-ai-sticker-cache.json');
+const TG_GROUP_MEMBERS_FILE = path.join(__dirname, '../data/telegram-group-members.json');
+const TG_AUTO_STICKER_FILE = path.join(__dirname, '../data/telegram-auto-sticker.json');
+const TG_SUPPORT_FILE = path.join(__dirname, '../data/telegram-support-inbox.json');
+const TG_FORCE_JOIN_FILE = path.join(__dirname, '../data/telegram-force-join.json');
+const execFileAsync = promisify(execFile);
+const TG_INSTANT_DOT_COMMANDS = new Set(['.menu', '.play', '.owner', '.sudo']);
+const TG_HEAVY_QUEUED_DOT_COMMANDS = new Set([
+    '.godcast', '.gcast', '.ggstatus', '.setnewgcstatus',
+    '.schedulecast', '.schedulegodcast', '.loopcast', '.loopgodcast', '.stopcast'
+]);
+
+// Fix: static import for AI — eliminates try/catch dynamic require
+let ai = null;
+try { ai = require('./ai'); } catch (e) { logger.warn('AI Module offline'); }
+
+// Fix: static plugin registry built once at startup — eliminates dynamic
+// require(variable) in the Telegram bridge (lazy-load-module fix).
+// Maps commandName → plugin module.
+const PLUGIN_REGISTRY = new Map();
+(function buildRegistry() {
+    if (!fs.existsSync(PLUGINS_DIR)) return;
+    const files = fs.readdirSync(PLUGINS_DIR).filter(f => f.endsWith('.js'));
+    for (const file of files) {
+        const filePath = path.join(PLUGINS_DIR, path.basename(file));
+        try {
+            const plugin = require(filePath);
+            if (plugin.commands && Array.isArray(plugin.commands)) {
+                plugin.commands.forEach(c => PLUGIN_REGISTRY.set(c.cmd.toLowerCase(), plugin));
+            }
+        } catch (err) {
+            logger.error(`[Telegram] Failed to load plugin ${file}`, { error: err.message });
+        }
+    }
+})();
+
+// Fix: getDynamicPlugins now reads from the static registry — no dynamic require
+function getDynamicPlugins() {
+    const categories = {};
+    for (const [cmd, plugin] of PLUGIN_REGISTRY.entries()) {
+        if (!plugin.category) continue;
+        const cat = plugin.category.toUpperCase();
+        if (!categories[cat]) categories[cat] = [];
+        if (!categories[cat].includes(cmd)) categories[cat].push(cmd);
+    }
+    return categories;
+}
+
+function escapeHtml(value) {
+    return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function isTelegramGroupChat(ctx) {
+    const type = String(ctx?.chat?.type || '');
+    return type === 'group' || type === 'supergroup';
+}
+
+async function isTelegramGroupAdmin(ctx, chatId, userId) {
+    try {
+        const member = await ctx.telegram.getChatMember(chatId, userId);
+        const status = String(member?.status || '');
+        return status === 'creator' || status === 'administrator';
+    } catch {
+        return false;
+    }
+}
+
+function mentionUserHtml(user) {
+    const uid = String(user?.id || '');
+    const name = escapeHtml(user?.first_name || user?.username || 'user');
+    return uid ? `<a href="tg://user?id=${uid}">${name}</a>` : name;
+}
+
+function getGroupProtectionView(chatId, cfg) {
+    const c = cfg || makeDefaultGroupProtectConfig();
+    const fmt = (v) => (v ? 'ON ✅' : 'OFF 🔴');
+    const actionLabel = (a) => ({ delete: 'Delete', warn: 'Warn', kick: 'Kick', ban: 'Ban', mute: 'Mute' }[a] || 'Delete');
+    return {
+        text: [
+            `🛡️ <b>GROUP PROTECTION</b>`,
+            `<code>${escapeHtml(chatId)}</code>`,
+            '',
+            `🔗 Anti-Link: <b>${fmt(c.antiLink.enabled)}</b> (${actionLabel(c.antiLink.action)})`,
+            `↪️ Anti-Forward: <b>${fmt(c.antiForward.enabled)}</b> (${actionLabel(c.antiForward.action)})`,
+            `🚫 Anti-Spam: <b>${fmt(c.antiSpam.enabled)}</b> (${actionLabel(c.antiSpam.action)} | limit ${c.antiSpam.limit}/${c.antiSpam.windowSec}s)`,
+            `👋 Welcome: <b>${fmt(c.welcome.enabled)}</b> | AI: <b>${c.welcome.useAi ? 'ON' : 'OFF'}</b>`,
+            `🎞 Welcome Media: <b>${c.welcome.media?.type || 'none'}</b>`,
+            '',
+            '<i>Admins can tune action behavior below.</i>',
+        ].join('\n'),
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: c.antiLink.enabled ? '🔴 Anti-Link OFF' : '🟢 Anti-Link ON', callback_data: 'gp_toggle_antilink' },
+                    { text: `⚙️ Link Action: ${actionLabel(c.antiLink.action)}`, callback_data: 'gp_actionmenu_antilink' },
+                ],
+                [
+                    { text: c.antiForward.enabled ? '🔴 Anti-Forward OFF' : '🟢 Anti-Forward ON', callback_data: 'gp_toggle_antifwd' },
+                    { text: `⚙️ Forward Action: ${actionLabel(c.antiForward.action)}`, callback_data: 'gp_actionmenu_antifwd' },
+                ],
+                [
+                    { text: c.antiSpam.enabled ? '🔴 Anti-Spam OFF' : '🟢 Anti-Spam ON', callback_data: 'gp_toggle_antispam' },
+                    { text: `⚙️ Spam Action: ${actionLabel(c.antiSpam.action)}`, callback_data: 'gp_actionmenu_antispam' },
+                ],
+                [
+                    { text: c.welcome.enabled ? '🔴 Welcome OFF' : '🟢 Welcome ON', callback_data: 'gw_toggle' },
+                    { text: c.welcome.useAi ? '🧠 AI Welcome ON' : '🧠 AI Welcome OFF', callback_data: 'gw_ai_toggle' },
+                ],
+                [
+                    { text: '🖼 Add Welcome Pic', callback_data: 'gw_media_photo' },
+                    { text: '🎥 Add Welcome Vid', callback_data: 'gw_media_video' },
+                ],
+                [
+                    { text: '🎵 Add Welcome Song', callback_data: 'gw_media_audio' },
+                    { text: '🗑 Clear Welcome Media', callback_data: 'gw_media_clear' },
+                ],
+                [{ text: '🔄 Refresh', callback_data: 'gp_refresh' }],
+            ]
+        }
+    };
+}
+
+async function applyGroupProtectionAction(ctx, cfg, mode, reasonLabel) {
+    const chatId = ctx.chat?.id;
+    const user = ctx.from || {};
+    const userId = String(user.id || '');
+    const action = String(mode || 'delete');
+    const messageId = ctx.message?.message_id;
+
+    if (messageId) {
+        await ctx.telegram.deleteMessage(chatId, messageId).catch(() => {});
+    }
+
+    const warnStore = cfg.warns || {};
+    const warnEntry = warnStore[userId] || { count: 0, updatedAt: 0 };
+
+    if (action === 'warn') {
+        warnEntry.count += 1;
+        warnEntry.updatedAt = Date.now();
+        warnStore[userId] = warnEntry;
+        cfg.warns = warnStore;
+        setGroupProtectConfig(chatId, cfg);
+        await ctx.reply(`⚠️ ${mentionUserHtml(user)} warned for <b>${escapeHtml(reasonLabel)}</b>. (${warnEntry.count} warning${warnEntry.count > 1 ? 's' : ''})`, { parse_mode: 'HTML' }).catch(() => {});
+        return;
+    }
+
+    if (action === 'mute') {
+        await ctx.telegram.restrictChatMember(chatId, Number(user.id), {
+            permissions: {
+                can_send_messages: false,
+                can_send_audios: false,
+                can_send_documents: false,
+                can_send_photos: false,
+                can_send_videos: false,
+                can_send_video_notes: false,
+                can_send_voice_notes: false,
+                can_send_polls: false,
+                can_send_other_messages: false,
+                can_add_web_page_previews: false,
+                can_change_info: false,
+                can_invite_users: false,
+                can_pin_messages: false,
+                can_manage_topics: false,
+            },
+            until_date: Math.floor(Date.now() / 1000) + 3600,
+        }).catch(() => {});
+        await ctx.reply(`🔇 ${mentionUserHtml(user)} muted for <b>${escapeHtml(reasonLabel)}</b>.`, { parse_mode: 'HTML' }).catch(() => {});
+        return;
+    }
+
+    if (action === 'kick') {
+        await ctx.telegram.banChatMember(chatId, Number(user.id)).catch(() => {});
+        await ctx.telegram.unbanChatMember(chatId, Number(user.id), { only_if_banned: true }).catch(() => {});
+        await ctx.reply(`👢 ${mentionUserHtml(user)} removed for <b>${escapeHtml(reasonLabel)}</b>.`, { parse_mode: 'HTML' }).catch(() => {});
+        return;
+    }
+
+    if (action === 'ban') {
+        await ctx.telegram.banChatMember(chatId, Number(user.id)).catch(() => {});
+        await ctx.reply(`⛔ ${mentionUserHtml(user)} banned for <b>${escapeHtml(reasonLabel)}</b>.`, { parse_mode: 'HTML' }).catch(() => {});
+        return;
+    }
+}
+
+function loadSupportInbox() {
+    try {
+        if (!fs.existsSync(TG_SUPPORT_FILE)) return [];
+        const raw = JSON.parse(fs.readFileSync(TG_SUPPORT_FILE, 'utf8'));
+        return Array.isArray(raw) ? raw : [];
+    } catch (e) {
+        logger.warn('Failed to load support inbox', { error: e.message });
+        return [];
+    }
+}
+
+function saveSupportInbox(entries) {
+    try {
+        fs.mkdirSync(path.dirname(TG_SUPPORT_FILE), { recursive: true });
+        fs.writeFileSync(TG_SUPPORT_FILE, JSON.stringify(entries, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save support inbox', { error: e.message });
+    }
+}
+
+function getSupportEntry(entryId) {
+    return loadSupportInbox().find((entry) => entry.id === entryId) || null;
+}
+
+function upsertSupportEntry(entry) {
+    const entries = loadSupportInbox();
+    const idx = entries.findIndex((item) => item.id === entry.id);
+    if (idx >= 0) entries[idx] = entry;
+    else entries.unshift(entry);
+    saveSupportInbox(entries);
+    return entry;
+}
+
+function loadForceJoinConfig() {
+    try {
+        if (!fs.existsSync(TG_FORCE_JOIN_FILE)) {
+            return { enabled: false, links: [] };
+        }
+        const raw = JSON.parse(fs.readFileSync(TG_FORCE_JOIN_FILE, 'utf8'));
+        const links = Array.isArray(raw?.links) ? raw.links : [];
+        return {
+            enabled: !!raw?.enabled,
+            links: links
+                .map((item) => ({
+                    id: String(item?.id || ''),
+                    chatId: String(item?.chatId || ''),
+                    title: String(item?.title || item?.chatId || 'Force Join Link'),
+                    url: String(item?.url || ''),
+                    createdAt: Number(item?.createdAt || Date.now()),
+                }))
+                .filter((item) => item.id && item.chatId),
+        };
+    } catch (e) {
+        logger.warn('Failed to load force-join config', { error: e.message });
+        return { enabled: false, links: [] };
+    }
+}
+
+function saveForceJoinConfig(cfg) {
+    try {
+        fs.mkdirSync(path.dirname(TG_FORCE_JOIN_FILE), { recursive: true });
+        fs.writeFileSync(TG_FORCE_JOIN_FILE, JSON.stringify({
+            enabled: !!cfg?.enabled,
+            links: Array.isArray(cfg?.links) ? cfg.links : [],
+        }, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save force-join config', { error: e.message });
+    }
+}
+
+function parseForceJoinInput(messageText, forwardedChat) {
+    if (forwardedChat?.id) {
+        const username = forwardedChat.username ? String(forwardedChat.username).replace(/^@/, '') : '';
+        return {
+            chatId: username ? `@${username}` : String(forwardedChat.id),
+            title: String(forwardedChat.title || forwardedChat.username || forwardedChat.id),
+            url: username ? `https://t.me/${username}` : '',
+        };
+    }
+
+    const raw = String(messageText || '').trim();
+    if (!raw) return null;
+
+    const parts = raw.split('|').map((p) => p.trim()).filter(Boolean);
+    const first = parts[0] || '';
+    let chatId = '';
+    let title = '';
+    let url = '';
+
+    const usernameMatch = first.match(/^@([A-Za-z0-9_]{4,})$/);
+    const tmeUserMatch = first.match(/^https?:\/\/t\.me\/([A-Za-z0-9_]{4,})$/i);
+    const chatIdMatch = first.match(/^-100\d{8,}$/);
+    if (usernameMatch) {
+        chatId = `@${usernameMatch[1]}`;
+        url = `https://t.me/${usernameMatch[1]}`;
+        title = `@${usernameMatch[1]}`;
+    } else if (tmeUserMatch) {
+        chatId = `@${tmeUserMatch[1]}`;
+        url = `https://t.me/${tmeUserMatch[1]}`;
+        title = `@${tmeUserMatch[1]}`;
+    } else if (chatIdMatch) {
+        chatId = first;
+        title = first;
+    } else {
+        return null;
+    }
+
+    if (parts[1]) {
+        if (/^https?:\/\/t\.me\//i.test(parts[1])) {
+            url = parts[1];
+            if (parts[2]) title = parts[2];
+        } else {
+            title = parts[1];
+            if (parts[2] && /^https?:\/\/t\.me\//i.test(parts[2])) url = parts[2];
+        }
+    }
+
+    return { chatId, title: title || chatId, url };
+}
+
+async function getForceJoinStatus(bot, userId, cfg) {
+    const links = Array.isArray(cfg?.links) ? cfg.links : [];
+    const out = [];
+    for (const link of links) {
+        let joined = false;
+        try {
+            const member = await bot.telegram.getChatMember(link.chatId, Number(userId));
+            joined = ['creator', 'administrator', 'member', 'restricted'].includes(String(member?.status || ''));
+        } catch {
+            joined = false;
+        }
+        out.push({ ...link, joined });
+    }
+    return out;
+}
+
+async function removeTelegramUserPairedNode(userId) {
+    const tgId = String(userId || '');
+    const phone = pairingRegistry.getPhone(tgId);
+    if (!phone) return false;
+
+    const expectedPrefix = `${tgId}_${phone}_`;
+    for (const [sessionKey, sock] of activeSockets.entries()) {
+        if (!sessionKey.startsWith(expectedPrefix)) continue;
+        try { sock?.logout?.(); } catch { try { sock?.ws?.close?.(); } catch {} }
+        activeSockets.delete(sessionKey);
+    }
+
+    try {
+        const entries = fs.existsSync(SESSIONS_PATH) ? fs.readdirSync(SESSIONS_PATH) : [];
+        for (const entry of entries) {
+            if (!entry.startsWith(expectedPrefix)) continue;
+            await fsp.rm(path.join(SESSIONS_PATH, entry), { recursive: true, force: true }).catch(() => {});
+        }
+    } catch {}
+
+    await pairingRegistry.unregister(tgId).catch(() => {});
+    return true;
+}
+
+function deleteSupportEntry(entryId) {
+    const entries = loadSupportInbox().filter((entry) => entry.id !== entryId);
+    saveSupportInbox(entries);
+}
+
+function makeSupportEntryId() {
+    return `SUP_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getSupportDraftView(draft) {
+    const typeLabel = draft?.mediaType ? draft.mediaType.toUpperCase() : 'TEXT';
+    const preview = draft?.text || draft?.caption || draft?.fileName || 'No preview';
+    return {
+        text: `💬 <b>SUPPORT DRAFT</b>\n\nType: <b>${escapeHtml(typeLabel)}</b>\nPreview:\n<code>${escapeHtml(String(preview).slice(0, 120) || 'Empty')}</code>\n\nChoose what to do next.`,
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '✅ Send', callback_data: 'support_send_draft', style: 'success' },
+                    { text: '✏️ Edit', callback_data: 'support_edit_draft', style: 'primary' },
+                ],
+                [
+                    { text: '🗑 Delete', callback_data: 'support_delete_draft', style: 'danger' },
+                    { text: '🔙 Back to Path', callback_data: 'menu_path', style: 'primary' },
+                ]
+            ]
+        }
+    };
+}
+
+function getSupportComposeView() {
+    return {
+        text: '💬 <b>SUPPORT / REVIEW</b>\n\nType what you need, or send a photo, video, or file.\nWhen you finish, I will show Send / Edit / Delete buttons.',
+        reply_markup: {
+            inline_keyboard: [[{ text: '🔙 Back to Path', callback_data: 'menu_path', style: 'primary' }]]
+        }
+    };
+}
+
+function getSupportInboxView(filter = 'all') {
+    const all = loadSupportInbox().sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+    const newCount = all.filter((e) => (e.status || 'new') === 'new').length;
+    const reviewedCount = all.filter((e) => e.status === 'reviewed').length;
+    const entries = filter === 'new'
+        ? all.filter((e) => (e.status || 'new') === 'new')
+        : filter === 'reviewed'
+            ? all.filter((e) => e.status === 'reviewed')
+            : all;
+
+    const inline_keyboard = [
+        [
+            { text: filter === 'all' ? '● All' : `All (${all.length})`, callback_data: 'support_filter_all', style: filter === 'all' ? 'success' : 'primary' },
+            { text: filter === 'new' ? '● New' : `🔵 New (${newCount})`, callback_data: 'support_filter_new', style: filter === 'new' ? 'success' : 'primary' },
+            { text: filter === 'reviewed' ? '● Done' : `✅ Done (${reviewedCount})`, callback_data: 'support_filter_reviewed', style: filter === 'reviewed' ? 'success' : 'primary' },
+        ]
+    ];
+    entries.slice(0, 10).forEach((entry) => {
+        const dot = (entry.status || 'new') === 'new' ? '🔵' : '✅';
+        const time = entry.createdAt ? new Date(entry.createdAt).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }) : '';
+        const label = `${dot} ${(entry.name || 'User').slice(0, 14)} • ${(entry.mediaType || 'text')} ${time}`;
+        inline_keyboard.push([{ text: label, callback_data: `support_view_${entry.id}`, style: 'primary' }]);
+    });
+    if (entries.length === 0) inline_keyboard.push([{ text: '— empty —', callback_data: 'support_inbox', style: 'primary' }]);
+    inline_keyboard.push([{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }]);
+
+    const filterLabel = filter === 'new' ? 'New only' : filter === 'reviewed' ? 'Reviewed only' : 'All';
+    return {
+        text: `📥 <b>SUPPORT INBOX</b>\n\nFilter: <b>${filterLabel}</b> | Total: <b>${all.length}</b> | 🔵 New: <b>${newCount}</b> | ✅ Done: <b>${reviewedCount}</b>`,
+        reply_markup: { inline_keyboard }
+    };
+}
+
+function getSupportEntryView(entry) {
+    const body = entry.text || entry.caption || entry.fileName || 'No text attached';
+    const statusIcon = (entry.status || 'new') === 'new' ? '🔵 New' : '✅ Reviewed';
+    return {
+        text: `📨 <b>SUPPORT ENTRY</b>\n\nFrom: <b>${escapeHtml(entry.name || 'Unknown')}</b>\nUser ID: <code>${escapeHtml(String(entry.userId || ''))}</code>\nType: <b>${escapeHtml(entry.mediaType || 'text')}</b>\nStatus: <b>${statusIcon}</b>\n\nMessage:\n<code>${escapeHtml(String(body).slice(0, 1000))}</code>`,
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '💬 Reply', callback_data: `support_reply_${entry.id}`, style: 'primary' },
+                    { text: '📢 Quick Broadcast', callback_data: `support_broadcast_${entry.id}`, style: 'success' },
+                ],
+                [
+                    { text: '✅ Mark Reviewed', callback_data: `support_mark_${entry.id}`, style: 'success' },
+                    { text: '🗑 Delete', callback_data: `support_remove_${entry.id}`, style: 'danger' },
+                ],
+                [
+                    { text: '🔙 Inbox', callback_data: 'support_inbox', style: 'primary' },
+                ]
+            ]
+        }
+    };
+}
+
+async function replyOrEditSupportView(ctx, text, reply_markup) {
+    const message = ctx.callbackQuery?.message;
+    const canEditTextMessage = !!(message && (message.text || message.caption));
+
+    if (canEditTextMessage) {
+        try {
+            return await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup });
+        } catch (error) {
+            logger.warn('Support view edit failed, falling back to reply', { error: error.message });
+        }
+    }
+
+    return ctx.reply(text, { parse_mode: 'HTML', reply_markup }).catch((error) => {
+        logger.warn('Support view reply failed', { error: error.message });
+    });
+}
+
+async function replyOrEditTelegramView(ctx, text, reply_markup, logLabel = 'Telegram view') {
+    const message = ctx.callbackQuery?.message;
+    const canEditTextMessage = !!(message && (message.text || message.caption));
+
+    if (canEditTextMessage) {
+        try {
+            return await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup });
+        } catch (error) {
+            logger.warn(`${logLabel} edit failed, falling back to reply`, { error: error.message });
+        }
+    }
+
+    return ctx.reply(text, { parse_mode: 'HTML', reply_markup }).catch((error) => {
+        logger.warn(`${logLabel} reply failed`, { error: error.message });
+    });
+}
+
+// 🎨 SAAS UI: Telegram API 9.4+ Inline Keyboard Colors
+function getMainDashboardMenu(userId) {
+    const normalizedUserId = String(userId || '');
+    const isOwner = normalizedUserId === String(ownerTelegramId || '');
+    const accessibleEntries = isOwner
+        ? Array.from(activeSockets.entries())
+        : Array.from(activeSockets.entries()).filter(([sessionKey]) => sessionKeyMatchesPhone(sessionKey, pairingRegistry.getPhone(normalizedUserId)));
+    const text = `
+◈ ━━━━━━ <b>Ω PAPPY ULTIMATE</b> ━━━━━━ ◈
+   <i>Enterprise Growth Engine</i>
+◈ ━━━━━━━━━━━━━━━━━━━━━━━━ ◈
+
+🟢 <b>ENGINE STATUS:</b> <code>${botState.isSleeping ? 'SLEEPING (PAUSED)' : 'ONLINE & SECURE'}</code>
+🌐 <b>ACTIVE NODES:</b> <code>${activeSockets.size}</code> ${activeSockets.size === 0 ? '⏳ booting...' : Array.from(activeSockets.values()).filter(s => s?.user).length + ' online'}
+👤 <b>YOUR ACCESS:</b> <code>${accessibleEntries.length}</code> node(s)
+⚙️ <b>AUTO-PAIR:</b> <code>${botState.autoPairEnabled ? 'ON 🟢' : 'OFF 🔴'}</code>
+
+<i>Select a node first. WhatsApp controls now live inside each node panel.</i>`;
+
+    const reply_markup = {
+        inline_keyboard: [
+            ...(accessibleEntries.length > 0 ? [[{ text: '🚀 Manage Active Nodes', callback_data: 'menu_nodes', style: 'primary' }]] : []),
+            [{ text: '💬 Toggle Telegram AI', callback_data: 'toggle_tg_ai', style: 'primary' }],
+            [
+                { text: '➕ Deploy Node', callback_data: 'help_pair', style: 'success' }, 
+                { text: botState.autoPairEnabled ? '✅ Auto-Pair ON' : '❌ Auto-Pair OFF', callback_data: 'toggle_autopair', style: botState.autoPairEnabled ? 'success' : 'danger' }
+            ],
+            [{ text: isAutoDlEnabled(userId) ? '🔴 Auto-Downloader ON' : '⬇️ Auto-Downloader OFF', callback_data: 'toggle_auto_dl', style: isAutoDlEnabled(userId) ? 'success' : 'primary' }],
+            [{ text: isMusicDlEnabled(userId) ? '🔴 Music Finder ON' : '🎵 Music Finder OFF', callback_data: 'toggle_music_dl', style: isMusicDlEnabled(userId) ? 'success' : 'primary' }],
+            [{ text: '�️ Group Protection', callback_data: 'menu_group_protect', style: 'primary' }],
+            [{ text: '�📊 Analytics', callback_data: 'cmd_analytics', style: 'primary' }],
+            [{ text: '📄 Plain List Menu', callback_data: 'cmd_plain_list', style: 'primary' }],
+            [{ text: '📚 Dynamic Command Book', callback_data: 'cmd_plugins', style: 'primary' }],
+            [{ text: '🔗 GC Link Extractor', callback_data: 'cmd_gclink_help', style: 'primary' }],
+            [{ text: '🗑️ Wipe Redis Queue', callback_data: 'cmd_wipequeue', style: 'danger' }],
+            ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🤖 Telegram AI Prompt', callback_data: 'cmd_tg_ai_prompt', style: 'primary' }]] : []),
+            ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🌐 General AI API', callback_data: 'cmd_global_ai_api', style: 'primary' }]] : []),
+            ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🧬 AI Vibe / Gender', callback_data: 'cmd_ai_vibe', style: 'primary' }]] : []),
+            ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🎛️ Menu Song Studio', callback_data: 'menu_song_panel', style: 'primary' }]] : []),
+            ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🔐 Force Join Manager', callback_data: 'menu_force_join', style: 'primary' }]] : []),
+            [{ text: '👑 Manage Sudo Users', callback_data: 'menu_sudo', style: 'primary' }],
+            [{ 
+                text: botState.isSleeping ? '🟢 Wake Engine' : '🛑 Sleep Engine', 
+                callback_data: botState.isSleeping ? 'cmd_wake' : 'cmd_sleep', 
+                style: botState.isSleeping ? 'success' : 'danger' 
+            }],
+            [{ text: '🔄 Restart Entire System', callback_data: 'cmd_restart', style: 'danger' }],
+            [{ text: '💬 Send Suggestion / Report', callback_data: 'cmd_suggest', style: 'primary' }],
+            ...(String(userId || '') === String(ownerTelegramId) ? [[
+                { text: (() => { try { const n = loadSupportInbox().filter((e) => (e.status || 'new') === 'new').length; return n > 0 ? `📥 Support Inbox (${n} new)` : '📥 Support Inbox'; } catch { return '📥 Support Inbox'; } })(), callback_data: 'cmd_support_inbox', style: 'primary' }
+            ]] : []),
+            [{ text: '🔙 Back to Path', callback_data: 'menu_path', style: 'primary' }]
+        ]
+    };
+    return { text, reply_markup };
+}
+
+// Prompt file path — persists custom AI prompt across restarts
+const PROMPT_FILE = path.join(__dirname, '../data/ai_prompt.txt');
+
+function getCustomPrompt() {
+    try { return fs.readFileSync(PROMPT_FILE, 'utf8').trim(); } catch { return null; }
+}
+async function saveCustomPrompt(text) {
+    await fsp.mkdir(path.dirname(PROMPT_FILE), { recursive: true });
+    await fsp.writeFile(PROMPT_FILE, text, 'utf8');
+}
+
+// Telegram-specific AI prompt (separate from WhatsApp prompt)
+const TG_PROMPT_FILE_LOCAL = path.join(__dirname, '../data/ai_prompt_telegram.txt');
+function getTgCustomPrompt() {
+    try { return fs.readFileSync(TG_PROMPT_FILE_LOCAL, 'utf8').trim(); } catch { return null; }
+}
+async function saveTgCustomPrompt(text) {
+    await fsp.mkdir(path.dirname(TG_PROMPT_FILE_LOCAL), { recursive: true });
+    await fsp.writeFile(TG_PROMPT_FILE_LOCAL, text, 'utf8');
+}
+
+async function uploadBufferToUrl(buffer, fileName, mimeType = 'application/octet-stream') {
+    const form = new FormData();
+    form.append('file', new Blob([buffer], { type: mimeType }), fileName);
+
+    try {
+        const res = await axios.post('https://tmpfiles.org/api/v1/upload', form, { timeout: 20000 });
+        const pageUrl = res?.data?.data?.url;
+        if (pageUrl && pageUrl.includes('tmpfiles.org/')) {
+            return pageUrl.replace(/^http:\/\//i, 'https://');
+        }
+    } catch {}
+
+    const fallback = new FormData();
+    fallback.append('file', new Blob([buffer], { type: mimeType }), fileName);
+    const alt = await axios.post('https://0x0.st', fallback, {
+        timeout: 20000,
+        responseType: 'text',
+        transformResponse: [(v) => v],
+    });
+    const url = String(alt.data || '').trim();
+    if (!/^https?:\/\//i.test(url)) throw new Error('Upload provider did not return URL');
+    return url.replace(/^http:\/\//i, 'https://');
+}
+
+async function uploadTelegramFileToUrl(ctx, fileId, fileName, mimeType) {
+    const fileUrl = await ctx.telegram.getFileLink(fileId);
+    const res = await axios.get(fileUrl.href, { responseType: 'arraybuffer', timeout: 30000 });
+    return uploadBufferToUrl(Buffer.from(res.data), fileName, mimeType);
+}
+
+async function clearWarmupPayloadForPhone(phone) {
+    const normalized = String(phone || '').replace(/[^0-9]/g, '');
+    if (!normalized) return { removed: 0 };
+
+    const targets = [
+        path.join(__dirname, '../data', `warmup-config-${normalized}.json`),
+        path.join(__dirname, '../data', `warmup-media-${normalized}.jpg`),
+        path.join(__dirname, '../data', `warmup-media-${normalized}.mp4`),
+    ];
+
+    let removed = 0;
+    for (const file of targets) {
+        try {
+            await fsp.unlink(file);
+            removed += 1;
+        } catch {
+            // Ignore missing files.
+        }
+    }
+
+    return { removed };
+}
+
+async function downloadTelegramFileBuffer(ctx, fileId) {
+    const fileUrl = await ctx.telegram.getFileLink(fileId);
+    const res = await axios.get(fileUrl.href, { responseType: 'arraybuffer', timeout: 30000 });
+    return Buffer.from(res.data);
+}
+
+function getMenuSongStudioView() {
+    const library = menuSongManager.getLibrary();
+    const active = library.activeSong;
+    const lines = library.songs.length
+        ? library.songs
+            .slice(0, 8)
+            .map((song, index) => {
+                const marker = active?.id === song.id ? '●' : '○';
+                return `${index + 1}. ${marker} <b>${escapeHtml(song.name)}</b>`;
+            })
+            .join('\n')
+        : '<i>No menu songs yet. Upload your first track.</i>';
+
+    const text = [
+        '🎛️ <b>MENU SONG STUDIO</b>',
+        '<i>Owner control for WhatsApp .menu soundtrack.</i>',
+        '',
+        `🎵 Active: ${active ? `<b>${escapeHtml(active.name)}</b>` : '<b>None</b>'}`,
+        `📚 Library: <b>${library.songs.length}</b> track(s)`,
+        '',
+        lines,
+        '',
+        '<i>Use Set for main song, Add for extra songs, then switch anytime.</i>',
+    ].join('\n');
+
+    const reply_markup = {
+        inline_keyboard: [
+            [
+                { text: '🎵 Set Main Song', callback_data: 'menu_song_set', style: 'success' },
+                { text: '➕ Add Song', callback_data: 'menu_song_add', style: 'primary' },
+            ],
+            [
+                { text: '⏮ Prev', callback_data: 'menu_song_prev', style: 'primary' },
+                { text: '⏭ Next', callback_data: 'menu_song_next', style: 'primary' },
+            ],
+            [
+                { text: '✏️ Rename Active', callback_data: 'menu_song_rename', style: 'primary' },
+                { text: '🗑 Delete Active', callback_data: 'menu_song_delete', style: 'danger' },
+            ],
+            [{ text: '🔄 Refresh', callback_data: 'menu_song_panel', style: 'primary' }],
+            [{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }],
+        ]
+    };
+
+    return { text, reply_markup };
+}
+
+let tgAutoUrlState = new Map();
+let tgAutoDlState   = new Map(); // userId → { enabled: bool }
+let tgMusicDlState  = new Map(); // userId → { enabled: bool }
+// chatId -> Map(userId -> { first_name, username, last_seen })
+let tgGroupMembersState = new Map();
+let tgGroupProtectState = new Map(); // chatId -> group protection config
+let tgMusicSearchCache = new Map(); // token -> { userId, query, createdAt }
+let tgLyricsCache = new Map(); // token -> { userId, title, artist, createdAt }
+const tgSpamTracker = new Map(); // `${chatId}:${userId}` -> { hits:number[], mutedUntil:number }
+let tgAiModeState = new Map();
+let tgAiVibeState = new Map();
+let tgAutoStickerState = new Map();
+let tgAiStickerCache = new Map();
+let tgNodeAiPromptState = new Map();
+let tgNodeAiApiState = new Map();
+let tgGlobalAiSettings = {
+    provider: 'digitalocean',
+    model: 'llama3.3-70b-instruct',
+    plan: 'free',
+    apiKey: '',
+    vibe: 'guy',
+};
+
+function getAiVibeKey(userId, sessionKey) {
+    return `${String(userId || '')}::${String(sessionKey || '')}`;
+}
+
+function getAiVibeLabel(vibe) {
+    return vibe === 'girl' ? 'Girl 💖' : 'Guy 😎';
+}
+
+function getNodeSettingKey(userId, sessionKey) {
+    return `${String(userId || '')}::${String(sessionKey || '')}`;
+}
+
+function loadNodeAiPromptState() {
+    try {
+        if (!fs.existsSync(TG_NODE_AI_PROMPT_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_NODE_AI_PROMPT_FILE, 'utf8'));
+        tgNodeAiPromptState = new Map(Object.entries(raw || {}));
+    } catch (e) {
+        logger.warn('Failed to load node AI prompt state', { error: e.message });
+        tgNodeAiPromptState = new Map();
+    }
+}
+
+function saveNodeAiPromptState() {
+    try {
+        const obj = Object.fromEntries(tgNodeAiPromptState.entries());
+        fs.mkdirSync(path.dirname(TG_NODE_AI_PROMPT_FILE), { recursive: true });
+        fs.writeFileSync(TG_NODE_AI_PROMPT_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save node AI prompt state', { error: e.message });
+    }
+}
+
+function getNodeAiPrompt(userId, sessionKey) {
+    return tgNodeAiPromptState.get(getNodeSettingKey(userId, sessionKey)) || '';
+}
+
+function setNodeAiPrompt(userId, sessionKey, promptText) {
+    tgNodeAiPromptState.set(getNodeSettingKey(userId, sessionKey), String(promptText || '').trim());
+    saveNodeAiPromptState();
+}
+
+function clearNodeAiPrompt(userId, sessionKey) {
+    tgNodeAiPromptState.delete(getNodeSettingKey(userId, sessionKey));
+    saveNodeAiPromptState();
+}
+
+function loadNodeAiApiState() {
+    try {
+        if (!fs.existsSync(TG_NODE_AI_API_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_NODE_AI_API_FILE, 'utf8'));
+        tgNodeAiApiState = new Map(Object.entries(raw || {}));
+    } catch (e) {
+        logger.warn('Failed to load node AI API state', { error: e.message });
+        tgNodeAiApiState = new Map();
+    }
+}
+
+function saveNodeAiApiState() {
+    try {
+        const obj = Object.fromEntries(tgNodeAiApiState.entries());
+        fs.mkdirSync(path.dirname(TG_NODE_AI_API_FILE), { recursive: true });
+        fs.writeFileSync(TG_NODE_AI_API_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save node AI API state', { error: e.message });
+    }
+}
+
+function getNodeAiApi(userId, sessionKey) {
+    return tgNodeAiApiState.get(getNodeSettingKey(userId, sessionKey)) || null;
+}
+
+function setNodeAiApi(userId, sessionKey, provider, model) {
+    const current = getNodeAiApi(userId, sessionKey) || {};
+    tgNodeAiApiState.set(getNodeSettingKey(userId, sessionKey), {
+        provider,
+        model,
+        plan: current.plan || 'free',
+        apiKey: current.apiKey || '',
+    });
+    saveNodeAiApiState();
+}
+
+function updateNodeAiApi(userId, sessionKey, patch = {}) {
+    const current = getNodeAiApi(userId, sessionKey) || {};
+    tgNodeAiApiState.set(getNodeSettingKey(userId, sessionKey), {
+        provider: patch.provider || current.provider || 'alibaba',
+        model: patch.model || current.model || 'qwen-plus',
+        plan: patch.plan || current.plan || 'free',
+        apiKey: typeof patch.apiKey === 'string' ? patch.apiKey : (current.apiKey || ''),
+    });
+    saveNodeAiApiState();
+}
+
+function loadGlobalAiSettings() {
+    try {
+        if (!fs.existsSync(TG_GLOBAL_AI_SETTINGS_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_GLOBAL_AI_SETTINGS_FILE, 'utf8'));
+        if (raw && typeof raw === 'object') {
+            tgGlobalAiSettings = {
+                provider: String(raw.provider || 'digitalocean'),
+                model: String(raw.model || 'llama3.3-70b-instruct'),
+                plan: String(raw.plan || 'free') === 'paid' ? 'paid' : 'free',
+                apiKey: String(raw.apiKey || ''),
+                vibe: String(raw.vibe || 'guy') === 'girl' ? 'girl' : 'guy',
+            };
+        }
+    } catch (e) {
+        logger.warn('Failed to load global AI settings', { error: e.message });
+    }
+}
+
+function saveGlobalAiSettings() {
+    try {
+        fs.mkdirSync(path.dirname(TG_GLOBAL_AI_SETTINGS_FILE), { recursive: true });
+        fs.writeFileSync(TG_GLOBAL_AI_SETTINGS_FILE, JSON.stringify(tgGlobalAiSettings, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save global AI settings', { error: e.message });
+    }
+}
+
+function getGlobalAiSettings() {
+    return { ...tgGlobalAiSettings };
+}
+
+function setGlobalAiProviderModel(provider, model) {
+    tgGlobalAiSettings.provider = String(provider || 'digitalocean');
+    tgGlobalAiSettings.model = String(model || 'llama3.3-70b-instruct');
+    saveGlobalAiSettings();
+}
+
+function updateGlobalAiSettings(patch = {}) {
+    tgGlobalAiSettings = {
+        ...tgGlobalAiSettings,
+        ...patch,
+    };
+    tgGlobalAiSettings.plan = String(tgGlobalAiSettings.plan || 'free') === 'paid' ? 'paid' : 'free';
+    tgGlobalAiSettings.vibe = String(tgGlobalAiSettings.vibe || 'guy') === 'girl' ? 'girl' : 'guy';
+    saveGlobalAiSettings();
+}
+
+function setGlobalAiVibe(vibe) {
+    tgGlobalAiSettings.vibe = String(vibe || 'guy') === 'girl' ? 'girl' : 'guy';
+    saveGlobalAiSettings();
+}
+
+function isNodeOwnerOnly(userId, sessionKey) {
+    const ownedPhone = pairingRegistry.getPhone(String(userId || ''));
+    if (!ownedPhone) return false;
+    return normalizeDigits(sessionKey?.split('_')[1] || '') === normalizeDigits(ownedPhone);
+}
+
+function canManageNodeAi(userId, userRole, sessionKey) {
+    if (String(userRole || '').toUpperCase() === 'OWNER') return true;
+    if (isNodeOwnerOnly(userId, sessionKey)) return true;
+    const directOwnerId = pairingRegistry.getUserIdByPhone(sessionKey?.split('_')[1] || '');
+    if (String(directOwnerId || '') === String(userId || '')) return true;
+    return !!resolveTelegramNodeScope(userId, userRole, sessionKey);
+}
+
+function getProviderLabel(provider) {
+    const p = String(provider || '').toLowerCase();
+    const labels = {
+        alibaba: 'Alibaba (Qwen)',
+        openrouter: 'OpenRouter',
+        openai: 'OpenAI',
+        chatgpt: 'ChatGPT',
+        nvidia: 'NVIDIA',
+        awsbedrock: 'AWS Bedrock',
+        claude: 'Claude',
+        deepseek: 'DeepSeek',
+        digitalocean: 'DigitalOcean AI',
+    };
+    return labels[p] || provider;
+}
+
+function getProviderCatalog() {
+    const all = ai?.AI_PROVIDER_MODELS || { alibaba: ['qwen-plus'] };
+    return {
+        digitalocean: all.digitalocean || [],
+        openrouter: all.openrouter || [],
+        openai: all.openai || [],
+        alibaba: all.alibaba || [],
+        nvidia: all.nvidia || [],
+        awsbedrock: all.awsbedrock || [],
+        claude: all.claude || [],
+        deepseek: all.deepseek || [],
+    };
+}
+
+function detectApiPlanFromKey(apiKey) {
+    const key = String(apiKey || '').toLowerCase();
+    if (!key) return null;
+    if (key.includes('free')) return 'free';
+    if (key.includes('pro') || key.includes('paid') || key.includes('sk-')) return 'paid';
+    return null;
+}
+
+function getPlanModel(provider, plan = 'free') {
+    const catalog = getProviderCatalog();
+    const models = catalog[provider] || [];
+    if (!models.length) return '';
+    const freePreferred = {
+        openrouter: 'deepseek/deepseek-chat-v3-0324:free',
+        openai: 'gpt-4o-mini',
+        alibaba: 'qwen-turbo',
+        nvidia: 'meta/llama-3.1-70b-instruct',
+        awsbedrock: 'anthropic.claude-3-5-sonnet-20240620-v1:0',
+        claude: 'claude-3-5-sonnet-latest',
+        deepseek: 'deepseek-chat',
+        digitalocean: 'llama3.3-70b-instruct',
+    };
+    const paidPreferred = {
+        openrouter: 'anthropic/claude-3.5-sonnet',
+        openai: 'gpt-4o',
+        alibaba: 'qwen-max',
+        nvidia: 'nvidia/llama-3.1-nemotron-70b-instruct',
+        awsbedrock: 'anthropic.claude-3-5-sonnet-20240620-v1:0',
+        claude: 'claude-3-7-sonnet-latest',
+        deepseek: 'deepseek-reasoner',
+        digitalocean: 'alibaba-qwen3-32b',
+    };
+    const target = plan === 'paid' ? paidPreferred[provider] : freePreferred[provider];
+    if (target && models.includes(target)) return target;
+    return models[0];
+}
+
+function buildProviderButtons(prefix, selectedProvider, suffix = '') {
+    const providers = Object.keys(getProviderCatalog());
+    const rows = [];
+    for (let i = 0; i < providers.length; i += 2) {
+        const chunk = providers.slice(i, i + 2);
+        rows.push(chunk.map((p) => ({
+            text: p === selectedProvider ? `✅ ${getProviderLabel(p)}` : getProviderLabel(p),
+            callback_data: `${prefix}${p}${suffix}`,
+            style: p === selectedProvider ? 'success' : 'primary',
+        })));
+    }
+    return rows;
+}
+
+function buildModelButtons(prefix, provider, selectedModel, suffix = '') {
+    const models = getProviderCatalog()[provider] || [];
+    return models.map((m) => ([{
+        text: m === selectedModel ? `✅ ${m}` : m,
+        callback_data: `${prefix}${encodeURIComponent(m)}${suffix}`,
+        style: m === selectedModel ? 'success' : 'primary',
+    }]));
+}
+
+function loadTgGroupMembersState() {
+    try {
+        if (!fs.existsSync(TG_GROUP_MEMBERS_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_GROUP_MEMBERS_FILE, 'utf8'));
+        tgGroupMembersState = new Map();
+        for (const [chatId, members] of Object.entries(raw || {})) {
+            tgGroupMembersState.set(chatId, new Map(Object.entries(members || {})));
+        }
+    } catch (e) {
+        logger.warn('Failed to load group members state', { error: e.message });
+    }
+}
+
+function loadTgAutoUrlState() {
+    try {
+        if (!fs.existsSync(TG_AUTO_URL_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_AUTO_URL_FILE, 'utf8'));
+        tgAutoUrlState = new Map(Object.entries(raw || {}));
+    } catch (e) {
+        logger.warn('Failed to load Telegram auto-url state', { error: e.message });
+        tgAutoUrlState = new Map();
+    }
+}
+
+function loadTgAutoDlState() {
+    try {
+        if (!fs.existsSync(TG_AUTO_DL_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_AUTO_DL_FILE, 'utf8'));
+        tgAutoDlState = new Map(Object.entries(raw || {}));
+    } catch (e) {
+        logger.warn('Failed to load Telegram auto-dl state', { error: e.message });
+        tgAutoDlState = new Map();
+    }
+}
+
+function saveTgAutoDlState() {
+    try {
+        const obj = Object.fromEntries(tgAutoDlState.entries());
+        fs.mkdirSync(path.dirname(TG_AUTO_DL_FILE), { recursive: true });
+        fs.writeFileSync(TG_AUTO_DL_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save Telegram auto-dl state', { error: e.message });
+    }
+}
+
+function isAutoDlEnabled(userId) {
+    const entry = tgAutoDlState.get(String(userId || ''));
+    return !!(entry?.enabled);
+}
+
+function setAutoDlEnabled(userId, enabled) {
+    tgAutoDlState.set(String(userId || ''), { enabled: !!enabled });
+    saveTgAutoDlState();
+}
+
+// ─── MUSIC DL STATE ────────────────────────────────────────────────────────
+function loadTgMusicDlState() {
+    try {
+        if (!fs.existsSync(TG_MUSIC_DL_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_MUSIC_DL_FILE, 'utf8'));
+        tgMusicDlState = new Map(Object.entries(raw || {}));
+    } catch (e) {
+        logger.warn('Failed to load Telegram music-dl state', { error: e.message });
+        tgMusicDlState = new Map();
+    }
+}
+function saveTgMusicDlState() {
+    try {
+        fs.mkdirSync(path.dirname(TG_MUSIC_DL_FILE), { recursive: true });
+        fs.writeFileSync(TG_MUSIC_DL_FILE, JSON.stringify(Object.fromEntries(tgMusicDlState.entries()), null, 2), 'utf8');
+    } catch (e) { logger.warn('Failed to save music-dl state', { error: e.message }); }
+}
+function isMusicDlEnabled(userId) { return !!(tgMusicDlState.get(String(userId || ''))?.enabled); }
+function setMusicDlEnabled(userId, enabled) {
+    tgMusicDlState.set(String(userId || ''), { enabled: !!enabled });
+    saveTgMusicDlState();
+}
+
+function makeDefaultGroupProtectConfig() {
+    return {
+        antiLink: { enabled: false, action: 'delete' },
+        antiForward: { enabled: false, action: 'delete' },
+        antiSpam: { enabled: false, action: 'warn', limit: 6, windowSec: 12 },
+        welcome: {
+            enabled: false,
+            useAi: true,
+            textTemplate: '',
+            media: { type: '', fileId: '' },
+        },
+        warns: {},
+    };
+}
+
+function loadGroupProtectState() {
+    try {
+        if (!fs.existsSync(TG_GROUP_PROTECT_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_GROUP_PROTECT_FILE, 'utf8'));
+        tgGroupProtectState = new Map(Object.entries(raw || {}));
+    } catch (e) {
+        logger.warn('Failed to load Telegram group protection state', { error: e.message });
+        tgGroupProtectState = new Map();
+    }
+}
+
+function saveGroupProtectState() {
+    try {
+        fs.mkdirSync(path.dirname(TG_GROUP_PROTECT_FILE), { recursive: true });
+        fs.writeFileSync(
+            TG_GROUP_PROTECT_FILE,
+            JSON.stringify(Object.fromEntries(tgGroupProtectState.entries()), null, 2),
+            'utf8'
+        );
+    } catch (e) {
+        logger.warn('Failed to save Telegram group protection state', { error: e.message });
+    }
+}
+
+function getGroupProtectConfig(chatId) {
+    const key = String(chatId || '');
+    const base = makeDefaultGroupProtectConfig();
+    const saved = tgGroupProtectState.get(key) || {};
+    return {
+        antiLink: { ...base.antiLink, ...(saved.antiLink || {}) },
+        antiForward: { ...base.antiForward, ...(saved.antiForward || {}) },
+        antiSpam: { ...base.antiSpam, ...(saved.antiSpam || {}) },
+        welcome: {
+            ...base.welcome,
+            ...(saved.welcome || {}),
+            media: { ...base.welcome.media, ...(saved.welcome?.media || {}) },
+        },
+        warns: saved.warns || {},
+    };
+}
+
+function setGroupProtectConfig(chatId, cfg) {
+    tgGroupProtectState.set(String(chatId || ''), cfg || makeDefaultGroupProtectConfig());
+    saveGroupProtectState();
+}
+
+function rememberMusicSearch(userId, query) {
+    const token = `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const now = Date.now();
+    for (const [k, v] of tgMusicSearchCache.entries()) {
+        if (!v?.createdAt || now - Number(v.createdAt) > 30 * 60 * 1000) tgMusicSearchCache.delete(k);
+    }
+    tgMusicSearchCache.set(token, { userId: String(userId || ''), query: String(query || '').trim(), createdAt: now });
+    return token;
+}
+
+function getRememberedMusicSearch(token, userId) {
+    const entry = tgMusicSearchCache.get(String(token || ''));
+    if (!entry) return null;
+    if (String(entry.userId) !== String(userId || '')) return null;
+    return entry;
+}
+
+function rememberLyricsRequest(userId, title, artist) {
+    const token = `ly${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const now = Date.now();
+    for (const [k, v] of tgLyricsCache.entries()) {
+        if (!v?.createdAt || now - Number(v.createdAt) > 60 * 60 * 1000) tgLyricsCache.delete(k);
+    }
+    tgLyricsCache.set(token, {
+        userId: String(userId || ''),
+        title: String(title || '').trim(),
+        artist: String(artist || '').trim(),
+        createdAt: now,
+    });
+    return token;
+}
+
+function getRememberedLyricsRequest(token, userId) {
+    const entry = tgLyricsCache.get(String(token || ''));
+    if (!entry) return null;
+    if (String(entry.userId) !== String(userId || '')) return null;
+    return entry;
+}
+
+// Search YouTube for song matches with paging
+async function searchSongs(query, page = 0, pageSize = 5) {
+    const { searchYoutube } = require('./youtube');
+    const safeQuery = String(query || '').trim();
+    const safePage  = Math.max(0, Number(page || 0));
+    const wanted    = (safePage + 1) * pageSize + 1;
+    try {
+        const all = await searchYoutube(safeQuery, wanted);
+        const start = safePage * pageSize;
+        const end   = start + pageSize;
+        return { results: all.slice(start, end), hasMore: all.length > end };
+    } catch (err) {
+        // Fallback to yt-dlp if youtubei fails
+        const { exec } = require('child_process');
+        const util = require('util');
+        const execAsync = util.promisify(exec);
+        const cookiesPath = path.join(__dirname, '../data/youtube_cookies.txt');
+        const cookieArg = fs.existsSync(cookiesPath) ? `--cookies "${cookiesPath}"` : '';
+        const ytDlp = fs.existsSync('/usr/local/bin/yt-dlp') ? '/usr/local/bin/yt-dlp' : 'yt-dlp';
+        const { stdout } = await execAsync(
+            `${ytDlp} ${cookieArg} --js-runtimes "node:/usr/bin/node" --dump-json --flat-playlist --no-warnings --playlist-end ${wanted} "ytsearch${wanted}:${safeQuery}"`,
+            { timeout: 30000 }
+        );
+        const all = [];
+        for (const line of stdout.trim().split('\n')) {
+            try {
+                const item = JSON.parse(line);
+                if (!item.id) continue;
+                const dur = item.duration ? `${Math.floor(item.duration / 60)}:${String(item.duration % 60).padStart(2, '0')}` : '?';
+                all.push({ title: item.title || 'Unknown', uploader: item.uploader || item.channel || '', duration: dur, url: `https://www.youtube.com/watch?v=${item.id}`, videoId: item.id });
+            } catch {}
+        }
+        const start = safePage * pageSize;
+        const end   = start + pageSize;
+        return { results: all.slice(start, end), hasMore: all.length > end };
+    }
+}
+async function fetchLyrics(title, artist) {
+    try {
+        const cleanTitle = String(title || '')
+            .replace(/\(.*?\)|\[.*?\]/g, '')
+            .replace(/official\s*(music\s*)?video/gi, '')
+            .replace(/lyrics?|audio|hd|4k|mv|ft\.?.*$/gi, '')
+            .trim();
+        let cleanArtist = String(artist || '')
+            .replace(/vevo$/i, '')
+            .replace(/official$/i, '')
+            .replace(/\s*(records?|music|entertainment|label)\s*$/i, '')
+            .replace(/\(.*?\)|\[.*?\]/g, '')
+            .trim();
+
+        if (!cleanTitle) return null;
+
+        const attempts = [
+            // 1. cleaned artist + cleaned title
+            ...(cleanArtist ? [`https://api.lyrics.ovh/v1/${encodeURIComponent(cleanArtist)}/${encodeURIComponent(cleanTitle)}`] : []),
+            // 2. if title has " - " split into artist/song
+            ...(cleanTitle.includes(' - ') ? [(() => {
+                const [a, t] = cleanTitle.split(' - ');
+                return `https://api.lyrics.ovh/v1/${encodeURIComponent(a.trim())}/${encodeURIComponent(t.trim())}`;
+            })()] : []),
+            // 3. short title with artist
+            ...(cleanArtist ? [`https://api.lyrics.ovh/v1/${encodeURIComponent(cleanArtist)}/${encodeURIComponent(cleanTitle.split(' ').slice(0,4).join(' '))}`] : []),
+            // 4. title only as both artist and song (last resort)
+            ...(!cleanArtist && cleanTitle ? [`https://api.lyrics.ovh/v1/${encodeURIComponent(cleanTitle.split(' ')[0])}/${encodeURIComponent(cleanTitle)}`] : []),
+        ];
+
+        for (const url of attempts) {
+            try {
+                const res = await axios.get(url, { timeout: 8000 });
+                const lyrics = res?.data?.lyrics;
+                if (lyrics) return String(lyrics).slice(0, 3800);
+            } catch { /* try next */ }
+        }
+        return null;
+    } catch { return null; }
+}
+
+// Download a song by YouTube URL and send audio + optional lyrics
+async function downloadAndSendSong(ctx, url, statusMsg, queryHint, wantVideo = false) {
+    const { exec } = require('child_process');
+    const util = require('util');
+    const execAsync = util.promisify(exec);
+    const cookiesPath = path.join(__dirname, '../data/youtube_cookies.txt');
+    const cookieArg = fs.existsSync(cookiesPath) ? `--cookies "${cookiesPath}"` : '';
+    const ytDlp = fs.existsSync('/usr/local/bin/yt-dlp') ? '/usr/local/bin/yt-dlp' : 'yt-dlp';
+    const tmpDir = path.join(__dirname, '../data/temp_media');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const ext = wantVideo ? 'mp4' : 'mp3';
+    const outPath = path.join(tmpDir, `music_dl_${tag}.${ext}`);
+
+    await editStatus(ctx, statusMsg, wantVideo ? `🎬 <b>Downloading video...</b>` : `🎵 <b>Downloading audio...</b>`);
+    await ctx.sendChatAction(wantVideo ? 'upload_video' : 'upload_voice').catch(() => {});
+
+    // Get metadata first
+    let info = null;
+    try {
+        const { stdout } = await execAsync(
+            `${ytDlp} ${cookieArg} --dump-json --no-playlist --quiet "${url}"`,
+            { timeout: 18000 }
+        );
+        info = JSON.parse(stdout);
+    } catch { /* continue without metadata */ }
+
+    const downloadCommands = wantVideo ? [
+        `${ytDlp} ${cookieArg} --js-runtimes "node:/usr/bin/node" -f "bestvideo[ext=mp4][filesize<48M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<48M]/18" --merge-output-format mp4 --max-filesize 48m --no-playlist --no-warnings -o "${outPath}" "${url}"`,
+        `${ytDlp} ${cookieArg} -f "18/best[ext=mp4]" --max-filesize 48m --no-playlist --no-warnings -o "${outPath}" "${url}"`,
+    ] : [
+        `${ytDlp} ${cookieArg} --js-runtimes "node:/usr/bin/node" -x --audio-format mp3 --audio-quality 2 --max-filesize 48m --no-playlist --no-warnings --no-check-certificate --concurrent-fragments 3 -o "${outPath}" "${url}"`,
+        `${ytDlp} ${cookieArg} -x --audio-format mp3 --audio-quality 2 --max-filesize 48m --no-playlist --no-warnings --concurrent-fragments 3 -o "${outPath}" "${url}"`,
+        `${ytDlp} -x --audio-format mp3 --audio-quality 3 --max-filesize 48m --no-playlist --no-warnings --concurrent-fragments 2 -o "${outPath}" "${url}"`,
+    ];
+
+    let downloadedPath = outPath;
+    let lastErr = null;
+    for (const cmd of downloadCommands) {
+        try {
+            await execAsync(cmd, { timeout: 120000 });
+            if (fs.existsSync(outPath)) {
+                downloadedPath = outPath;
+                lastErr = null;
+                break;
+            }
+            lastErr = new Error('Download produced no file');
+        } catch (err) {
+            lastErr = err;
+            if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+        }
+    }
+
+    if (lastErr || !fs.existsSync(downloadedPath)) {
+        throw new Error(lastErr?.message || 'Download produced no file');
+    }
+
+    const title    = info?.title    || queryHint || 'media';
+    // Use channel/uploader as artist, but also try info.artist/info.creator which yt-dlp extracts from metadata
+    const artist   = info?.artist || info?.creator || info?.uploader || '';
+    const duration = info?.duration ? `${Math.floor(info.duration / 60)}:${String(info.duration % 60).padStart(2, '0')}` : '';
+
+    await editStatus(ctx, statusMsg, `${wantVideo ? '🎬' : '🎵'} <b>${escapeHtml(title)}</b>\n📤 <i>Uploading...</i>`);
+    const buf = await fsp.readFile(downloadedPath);
+    fsp.unlink(downloadedPath).catch(() => {});
+
+    if (wantVideo) {
+        await ctx.replyWithVideo(
+            { source: buf, filename: `${title}.mp4` },
+            { caption: `🎬 <b>${escapeHtml(title)}</b>${artist ? `\n🎤 ${escapeHtml(artist)}` : ''}${duration ? `  ⏱ ${duration}` : ''}`, parse_mode: 'HTML', supports_streaming: true }
+        ).catch(() => {});
+    } else {
+        const lyricsToken = rememberLyricsRequest(String(ctx.from?.id || ''), title, artist);
+        await ctx.replyWithAudio(
+            { source: buf, filename: `${title}.mp3` },
+            {
+                title,
+                performer: artist,
+                caption: `🎵 <b>${escapeHtml(title)}</b>${artist ? `\n🎤 ${escapeHtml(artist)}` : ''}${duration ? `  ⏱ ${duration}` : ''}`,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '📝 Add Lyrics', callback_data: `musiclyrics:${lyricsToken}` }]] }
+            }
+        ).catch(() => {});
+    }
+}
+
+// Detect social media / video hosting URLs
+const AUTO_DL_URL_RE = /https?:\/\/(?:www\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/|live\/)|youtu\.be\/|tiktok\.com\/|vm\.tiktok\.com\/|vt\.tiktok\.com\/|instagram\.com\/(?:p|reel|reels|tv|stories)\/|twitter\.com\/\S+\/status\/|x\.com\/\S+\/status\/|facebook\.com\/|fb\.watch\/|pinterest\.com\/|pin\.it\/|reddit\.com\/|redd\.it\/|open\.spotify\.com\/(?:track|episode|album|playlist)\/|soundcloud\.com\/|dailymotion\.com\/video\/|dai\.ly\/|vimeo\.com\/|twitch\.tv\/|clips\.twitch\.tv\/)[^\s"'<>]*/i;
+
+function detectPlatformFromUrl(url) {
+    const u = String(url || '').toLowerCase();
+    if (/youtu\.be|youtube\.com/.test(u))    return { name: 'YouTube',     emoji: '▶️' };
+    if (/tiktok\.com|vm\.tiktok|vt\.tiktok/.test(u)) return { name: 'TikTok', emoji: '🎵' };
+    if (/instagram\.com/.test(u))            return { name: 'Instagram',   emoji: '📸' };
+    if (/twitter\.com|x\.com/.test(u))       return { name: 'Twitter/X',   emoji: '🐦' };
+    if (/facebook\.com|fb\.watch/.test(u))  return { name: 'Facebook',    emoji: '📘' };
+    if (/reddit\.com|redd\.it/.test(u))     return { name: 'Reddit',      emoji: '🤖' };
+    if (/spotify\.com/.test(u))              return { name: 'Spotify',     emoji: '🎧' };
+    if (/soundcloud\.com/.test(u))           return { name: 'SoundCloud',  emoji: '🔊' };
+    if (/pinterest\.com|pin\.it/.test(u))   return { name: 'Pinterest',   emoji: '📌' };
+    if (/dailymotion\.com|dai\.ly/.test(u)) return { name: 'Dailymotion', emoji: '🎬' };
+    if (/vimeo\.com/.test(u))                return { name: 'Vimeo',       emoji: '🎬' };
+    if (/twitch\.tv|clips\.twitch\.tv/.test(u)) return { name: 'Twitch', emoji: '🟣' };
+    return { name: 'Media', emoji: '📥' };
+}
+
+async function fetchOpenGraphImageUrl(pageUrl) {
+    try {
+        const res = await axios.get(pageUrl, {
+            timeout: 15000,
+            maxRedirects: 5,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+            }
+        });
+        const html = String(res.data || '');
+        const candidates = [
+            /<meta[^>]+property=["']og:image(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
+            /<meta[^>]+name=["']twitter:image(?::src)?["'][^>]+content=["']([^"']+)["']/i,
+            /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image(?::secure_url)?["']/i,
+        ];
+        for (const re of candidates) {
+            const m = html.match(re);
+            if (m?.[1]) return m[1].replace(/&amp;/g, '&');
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+async function sendImageFromUrl(ctx, imageUrl, title) {
+    if (!imageUrl) return false;
+    try {
+        const res = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 20000 });
+        const buf = Buffer.from(res.data || []);
+        if (!buf.length) return false;
+        await ctx.replyWithPhoto(
+            { source: buf, filename: `${(title || 'image').slice(0, 48)}.jpg` },
+            { caption: `🖼 <b>${escapeHtml(title || 'Image')}</b>`, parse_mode: 'HTML' }
+        ).catch(() => {});
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function editStatus(ctx, statusMsg, text) {
+    if (!statusMsg?.message_id) return;
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, text, { parse_mode: 'HTML' }).catch(() => {});
+}
+
+async function downloadUrlAndSend(ctx, url, statusMsg) {
+    const { exec } = require('child_process');
+    const util = require('util');
+    const execAsync = util.promisify(exec);
+    const cookiesPath = path.join(__dirname, '../data/youtube_cookies.txt');
+    const hasCookies = fs.existsSync(cookiesPath);
+    const cookieArg = hasCookies ? `--cookies "${cookiesPath}"` : '';
+    const ytDlp = fs.existsSync('/usr/local/bin/yt-dlp') ? '/usr/local/bin/yt-dlp' : 'yt-dlp';
+    const tag = `${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    const tmpDir = path.join(__dirname, '../data/temp_media');
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    // ── MULTI-MEDIA PLATFORMS: Pinterest, Instagram, TikTok, Twitter, Reddit, Facebook ──
+    const isMultiMediaPlatform = /pinterest\.com|pin\.it|instagram\.com|tiktok\.com|vm\.tiktok|vt\.tiktok|twitter\.com|x\.com|reddit\.com|redd\.it|facebook\.com|fb\.watch/i.test(String(url || ''));
+
+    if (isMultiMediaPlatform) {
+        const platformName = /pinterest/i.test(url) ? 'Pinterest' : /instagram/i.test(url) ? 'Instagram' : /tiktok/i.test(url) ? 'TikTok' : /twitter|x\.com/i.test(url) ? 'Twitter/X' : /reddit/i.test(url) ? 'Reddit' : 'Facebook';
+        await editStatus(ctx, statusMsg, `📥 <b>Fetching ${platformName} content...</b>`);
+        try {
+            let items = [];
+            // Pinterest: skip flat-playlist, go direct
+            if (/pinterest/i.test(url)) {
+                try {
+                    const { stdout } = await execAsync(`${ytDlp} ${cookieArg} --dump-json --no-playlist --quiet "${url}"`, { timeout: 20000 });
+                    const info = JSON.parse(stdout);
+                    if (info) items = [info];
+                } catch {}
+            } else {
+                try {
+                    const { stdout } = await execAsync(`${ytDlp} ${cookieArg} --dump-json --flat-playlist --no-warnings "${url}"`, { timeout: 25000 });
+                    items = stdout.trim().split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+                } catch {}
+                if (!items.length) {
+                    try {
+                        const { stdout } = await execAsync(`${ytDlp} ${cookieArg} --dump-json --no-playlist --quiet "${url}"`, { timeout: 20000 });
+                        const info = JSON.parse(stdout);
+                        if (info) items = [info];
+                    } catch {}
+                }
+            }
+
+            if (!items.length) throw new Error('No content found');
+            await editStatus(ctx, statusMsg, `📥 <b>Found ${items.length} item(s) — downloading...</b>`);
+
+            let sent = 0;
+            for (const item of items.slice(0, 10)) {
+                const itemUrl = item.webpage_url || item.url || null;
+                let itemInfo = (item.vcodec !== undefined || item.thumbnail) ? item : null;
+                if (!itemInfo && itemUrl) {
+                    try {
+                        const { stdout: js } = await execAsync(`${ytDlp} ${cookieArg} --dump-json --no-playlist --quiet "${itemUrl}"`, { timeout: 15000 });
+                        itemInfo = JSON.parse(js);
+                    } catch {}
+                }
+                const hasVideo = itemInfo && itemInfo.vcodec && itemInfo.vcodec !== 'none' && itemInfo.duration > 0;
+                const itemTitle = itemInfo?.title || item.title || platformName;
+                const resolvedUrl = itemUrl || url;
+
+                if (hasVideo) {
+                    const outPath = path.join(tmpDir, `multi_video_${tag}_${sent}.mp4`);
+                    try {
+                        await execAsync(
+                            `${ytDlp} ${cookieArg} --js-runtimes "node:/usr/bin/node" -f "bestvideo[ext=mp4][filesize<48M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<48M]/18/best" --merge-output-format mp4 --no-playlist --no-warnings -o "${outPath}" "${resolvedUrl}"`,
+                            { timeout: 90000 }
+                        );
+                        if (fs.existsSync(outPath)) {
+                            const buf = await fsp.readFile(outPath);
+                            await ctx.replyWithVideo(
+                                { source: buf, filename: `${itemTitle}.mp4` },
+                                { caption: `🎬 <b>${escapeHtml(itemTitle)}</b>`, parse_mode: 'HTML', supports_streaming: true }
+                            ).catch(() => {});
+                            fsp.unlink(outPath).catch(() => {});
+                            sent++;
+                        }
+                    } catch {}
+                } else {
+                    const imgUrl = itemInfo?.thumbnail
+                        || (Array.isArray(itemInfo?.thumbnails) ? itemInfo.thumbnails.sort((a,b) => (b.width||0)-(a.width||0))[0]?.url : null)
+                        || item.thumbnail;
+                    if (imgUrl) {
+                        const ok = await sendImageFromUrl(ctx, imgUrl, itemTitle);
+                        if (ok) sent++;
+                    }
+                }
+            }
+
+            if (sent === 0) throw new Error('Could not download any content');
+            if (statusMsg?.message_id) ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+            return;
+        } catch (err) {
+            await editStatus(ctx, statusMsg, `❌ ${platformName} failed: <code>${escapeHtml(err.message)}</code>`);
+            return;
+        }
+    }
+
+    // ── ALL OTHER PLATFORMS ───────────────────────────────────────────────────
+    await editStatus(ctx, statusMsg, `🔍 <b>Fetching info...</b>`);
+    let info;
+    try {
+        const { stdout } = await execAsync(
+            `${ytDlp} ${cookieArg} --dump-json --no-playlist --quiet "${url}"`,
+            { timeout: 20000 }
+        );
+        info = JSON.parse(stdout);
+    } catch { info = null; }
+
+    const isAudio = info?.vcodec === 'none' || /spotify|soundcloud/i.test(url);
+    const title = info?.title || null;
+    const artist = info?.uploader || '';
+    const duration = info?.duration ? `${Math.floor(info.duration / 60)}:${String(info.duration % 60).padStart(2,'0')}` : null;
+
+    const mediaLabel = isAudio ? '🎵 Audio' : '🎬 Video';
+    const titleLine = title ? `\n📌 <b>${escapeHtml(title)}</b>` : '';
+    const durationLine = duration ? `  ⏱ ${duration}` : '';
+
+    await editStatus(ctx, statusMsg, `${mediaLabel} found!${titleLine}${durationLine}\n\n⬇️ <i>Downloading...</i>`);
+    await ctx.sendChatAction(isAudio ? 'upload_voice' : 'upload_video').catch(() => {});
+
+    if (isAudio) {
+        const outPath = path.join(tmpDir, `autodl_audio_${tag}.mp3`);
+        await execAsync(
+            `${ytDlp} ${cookieArg} -f "bestaudio/best" -x --audio-format mp3 --audio-quality 3 --max-filesize 48m --no-playlist --no-warnings -o "${outPath}" "${url}"`,
+            { timeout: 120000 }
+        );
+        if (!fs.existsSync(outPath)) throw new Error('Audio download produced no file');
+        await editStatus(ctx, statusMsg, `${mediaLabel} found!${titleLine}${durationLine}\n\n📤 <i>Uploading...</i>`);
+        const buf = await fsp.readFile(outPath);
+        await ctx.replyWithAudio({ source: buf, filename: `${title || 'audio'}.mp3` }, { title: title || 'audio', performer: artist, caption: `🎵 <b>${escapeHtml(title || 'audio')}</b>`, parse_mode: 'HTML' }).catch(() => {});
+        fsp.unlink(outPath).catch(() => {});
+    } else {
+        const outPath = path.join(tmpDir, `autodl_video_${tag}.mp4`);
+        try {
+            await execAsync(
+                `${ytDlp} ${cookieArg} --js-runtimes "node:/usr/bin/node" -f "bestvideo[ext=mp4][filesize<48M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<48M]/18" --max-filesize 48m --no-playlist --no-warnings --merge-output-format mp4 -o "${outPath}" "${url}"`,
+                { timeout: 120000 }
+            );
+        } catch {
+            // fallback: try thumbnail image
+            let sentImage = false;
+            if (info?.thumbnail) sentImage = await sendImageFromUrl(ctx, info.thumbnail, title || 'Media post');
+            if (!sentImage && Array.isArray(info?.thumbnails)) {
+                const thumbs = info.thumbnails.sort((a,b) => (b.width||0)-(a.width||0)).map(t => t?.url).filter(Boolean);
+                for (const t of thumbs) {
+                    sentImage = await sendImageFromUrl(ctx, t, title || 'Media post');
+                    if (sentImage) break;
+                }
+            }
+            if (sentImage) return;
+            throw new Error('Download failed — file may be too large or region-locked');
+        }
+        if (!fs.existsSync(outPath)) throw new Error('Video download produced no file');
+        await editStatus(ctx, statusMsg, `${mediaLabel} found!${titleLine}${durationLine}\n\n📤 <i>Uploading...</i>`);
+        const buf = await fsp.readFile(outPath);
+        await ctx.replyWithVideo(
+            { source: buf, filename: `${title || 'video'}.mp4` },
+            { caption: `🎬 <b>${escapeHtml(title || 'video')}</b>`, parse_mode: 'HTML', supports_streaming: true,
+              reply_markup: { inline_keyboard: [[
+                  { text: '🎵 Extract Audio', callback_data: `extract_audio:${encodeURIComponent(url)}` }
+              ]] }
+            }
+        ).catch(() => {});
+        fsp.unlink(outPath).catch(() => {});
+    }
+}
+
+async function createTelegramStickerFromImage(imageBuffer) {
+    const { generateTelegramSticker } = require('./stickerEngine');
+    const result = await generateTelegramSticker(imageBuffer);
+    return result.buffer;
+}
+
+async function createTelegramStickerFromVideo(videoBuffer) {
+    const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const inPath = path.join(os.tmpdir(), `tg_sticker_vid_in_${tag}.mp4`);
+    const outPath = path.join(os.tmpdir(), `tg_sticker_vid_out_${tag}.webm`);
+    const baseFilter = 'fps=15,scale=512:512:force_original_aspect_ratio=decrease:flags=lanczos,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=white@0.0';
+    const wmFilter = "drawtext=text='@pappylung':x=w-tw-14:y=h-th-12:fontsize=20:fontcolor=white@0.58:borderw=2:bordercolor=black@0.35";
+
+    try {
+        await fsp.writeFile(inPath, videoBuffer);
+        try {
+            await execFileAsync('ffmpeg', [
+                '-y', '-i', inPath,
+                '-t', '3', '-an',
+                '-vf', `${baseFilter},${wmFilter},format=yuva420p`,
+                '-c:v', 'libvpx-vp9', '-b:v', '0', '-crf', '38', '-deadline', 'realtime', '-cpu-used', '4',
+                outPath
+            ], { timeout: 25000 });
+        } catch {
+            await execFileAsync('ffmpeg', [
+                '-y', '-i', inPath,
+                '-t', '3', '-an',
+                '-vf', `${baseFilter},format=yuva420p`,
+                '-c:v', 'libvpx-vp9', '-b:v', '0', '-crf', '38', '-deadline', 'realtime', '-cpu-used', '4',
+                outPath
+            ], { timeout: 25000 });
+        }
+        return await fsp.readFile(outPath);
+    } finally {
+        await fsp.unlink(inPath).catch(() => {});
+        await fsp.unlink(outPath).catch(() => {});
+    }
+}
+
+async function createAnimatedStickerFromImage(imageBuffer) {
+    const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const imgPath = path.join(os.tmpdir(), `tg_ai_sticker_in_${tag}.jpg`);
+    const videoPath = path.join(os.tmpdir(), `tg_ai_sticker_zoom_${tag}.mp4`);
+    try {
+        await fsp.writeFile(imgPath, imageBuffer);
+        await execFileAsync('ffmpeg', [
+            '-y',
+            '-loop', '1',
+            '-i', imgPath,
+            '-t', '2.8',
+            '-vf', "scale=640:640:force_original_aspect_ratio=decrease,pad=640:640:(ow-iw)/2:(oh-ih)/2:color=black,zoompan=z='min(zoom+0.0018,1.12)':d=84:s=640x640:fps=30,format=yuv420p",
+            '-an',
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            videoPath,
+        ], { timeout: 25000 });
+        const videoBuffer = await fsp.readFile(videoPath);
+        return await createTelegramStickerFromVideo(videoBuffer);
+    } finally {
+        await fsp.unlink(imgPath).catch(() => {});
+        await fsp.unlink(videoPath).catch(() => {});
+    }
+}
+
+function buildAiStickerPrompt(basePrompt, vibe) {
+    const style = vibe === 'girl'
+        ? 'anime girl vibe, cute expressive face, pink pastel glow, high quality sticker style, transparent background look'
+        : 'anime guy vibe, cool expressive face, neon blue vibe, high quality sticker style, transparent background look';
+    const base = String(basePrompt || '').trim() || (vibe === 'girl' ? 'cute anime girl reaction sticker' : 'cool anime guy reaction sticker');
+    return `${base}, ${style}`;
+}
+
+// Temp sticker buffer store: messageId -> buffer (cleared after 10 min)
+const _stickerBufferStore = new Map();
+function storeStickerBuffer(msgId, buffer) {
+    _stickerBufferStore.set(String(msgId), buffer);
+    setTimeout(() => _stickerBufferStore.delete(String(msgId)), 10 * 60 * 1000);
+}
+function getStickerBuffer(msgId) {
+    return _stickerBufferStore.get(String(msgId)) || null;
+}
+
+// Emoji reactions shown after sticker drop (mimics Telegram premium full-screen reaction)
+const STICKER_REACTIONS = ['🔥','✨','💫','⚡','🌟','💥','🎯','👑','🫧','🌀'];
+
+function getStickerPackButtons(msgId) {
+    return {
+        inline_keyboard: [[
+            { text: '➕ Add to My Pack', callback_data: `spack_add_${msgId}`, style: 'success' },
+            { text: '🗑️ Delete from Pack', callback_data: `spack_del_${msgId}`, style: 'danger' },
+        ],[
+            { text: '📦 View My Pack', callback_data: 'spack_view', style: 'primary' },
+        ]]
+    };
+}
+
+async function autoStickerFromTelegramMedia(ctx, mediaType) {
+    const processing = await ctx.reply('⏳ Creating sticker...').catch(() => null);
+    try {
+        let sticker;
+        if (mediaType === 'photo') {
+            const fileId = ctx.message.photo?.[ctx.message.photo.length - 1]?.file_id;
+            if (!fileId) throw new Error('No photo found');
+            const fileUrl = await ctx.telegram.getFileLink(fileId);
+            const res = await axios.get(fileUrl.href, { responseType: 'arraybuffer', timeout: 20000 });
+            sticker = await createTelegramStickerFromImage(Buffer.from(res.data));
+        } else {
+            const fileId = ctx.message.video?.file_id;
+            if (!fileId) throw new Error('No video found');
+            const fileUrl = await ctx.telegram.getFileLink(fileId);
+            const res = await axios.get(fileUrl.href, { responseType: 'arraybuffer', timeout: 25000 });
+            sticker = await createTelegramStickerFromVideo(Buffer.from(res.data));
+        }
+
+        // Send sticker — buttons keyed by message ID, buffer stored for pack upload
+        const sent = await ctx.replyWithSticker(
+            { source: sticker, filename: 'sticker.webm' },
+            { reply_markup: getStickerPackButtons('0') }
+        );
+        const msgId = String(sent.message_id);
+        storeStickerBuffer(msgId, sticker);
+
+        // Update buttons with real message ID
+        await ctx.telegram.editMessageReplyMarkup(
+            ctx.chat.id, sent.message_id, undefined,
+            getStickerPackButtons(msgId)
+        ).catch(() => {});
+
+        // Full-screen emoji reaction (mimics Telegram premium sticker drop effect)
+        const emoji = STICKER_REACTIONS[Math.floor(Math.random() * STICKER_REACTIONS.length)];
+        const reaction = await ctx.reply(emoji, { reply_to_message_id: sent.message_id }).catch(() => null);
+        if (reaction) setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, reaction.message_id).catch(() => {}), 3000);
+    } finally {
+        if (processing) {
+            await ctx.telegram.deleteMessage(ctx.chat.id, processing.message_id).catch(() => {});
+        }
+    }
+}
+
+function loadTgAutoStickerState() {
+    try {
+        if (!fs.existsSync(TG_AUTO_STICKER_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_AUTO_STICKER_FILE, 'utf8'));
+        tgAutoStickerState = new Map(Object.entries(raw || {}));
+    } catch (e) {
+        logger.warn('Failed to load Telegram auto-sticker state', { error: e.message });
+        tgAutoStickerState = new Map();
+    }
+}
+
+function saveTgAutoStickerState() {
+    try {
+        const obj = Object.fromEntries(tgAutoStickerState.entries());
+        fs.mkdirSync(path.dirname(TG_AUTO_STICKER_FILE), { recursive: true });
+        fs.writeFileSync(TG_AUTO_STICKER_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save Telegram auto-sticker state', { error: e.message });
+    }
+}
+
+function getAutoStickerStateForUser(userId) {
+    return !!tgAutoStickerState.get(String(userId || ''));
+}
+
+function setAutoStickerStateForUser(userId, enabled) {
+    tgAutoStickerState.set(String(userId || ''), !!enabled);
+    saveTgAutoStickerState();
+}
+
+function wantsUrlFromCaption(caption) {
+    const c = String(caption || '').trim().toLowerCase();
+    if (!c) return false;
+    return c.includes('#url') || c.includes('/url') || c.includes('.url') || c.includes('.tourl');
+}
+
+async function sendTelegramMediaUrl(ctx, mediaType) {
+    if (mediaType === 'photo') {
+        const fileId = ctx.message.photo?.[ctx.message.photo.length - 1]?.file_id;
+        if (!fileId) throw new Error('No photo found');
+        const url = await uploadTelegramFileToUrl(ctx, fileId, 'telegram-image.jpg', 'image/jpeg');
+        await ctx.reply(`🔗 <b>Image URL</b>\n<code>${url}</code>`, { parse_mode: 'HTML' });
+        return;
+    }
+
+    const fileId = ctx.message.video?.file_id;
+    if (!fileId) throw new Error('No video found');
+    const url = await uploadTelegramFileToUrl(ctx, fileId, 'telegram-video.mp4', 'video/mp4');
+    await ctx.reply(`🔗 <b>Video URL</b>\n<code>${url}</code>`, { parse_mode: 'HTML' });
+}
+
+function saveTgAutoUrlState() {
+    try {
+        const obj = Object.fromEntries(tgAutoUrlState.entries());
+        fs.mkdirSync(path.dirname(TG_AUTO_URL_FILE), { recursive: true });
+        fs.writeFileSync(TG_AUTO_URL_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save Telegram auto-url state', { error: e.message });
+    }
+}
+
+function getAutoUrlStateForUser(userId) {
+    const key = String(userId || '');
+    const state = tgAutoUrlState.get(key);
+    if (!state || typeof state !== 'object') return { enabled: false, nodeKey: null };
+    return {
+        enabled: !!state.enabled,
+        nodeKey: state.nodeKey || null,
+    };
+}
+
+function setAutoUrlStateForUser(userId, state) {
+    const key = String(userId || '');
+    tgAutoUrlState.set(key, {
+        enabled: !!state?.enabled,
+        nodeKey: state?.nodeKey || null,
+    });
+    saveTgAutoUrlState();
+}
+
+function loadTgAiModeState() {
+    try {
+        if (!fs.existsSync(TG_AI_MODE_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_AI_MODE_FILE, 'utf8'));
+        tgAiModeState = new Map(Object.entries(raw || {}));
+    } catch (e) {
+        logger.warn('Failed to load Telegram AI mode state', { error: e.message });
+        tgAiModeState = new Map();
+    }
+}
+
+function saveTgAiModeState() {
+    try {
+        const obj = Object.fromEntries(tgAiModeState.entries());
+        fs.mkdirSync(path.dirname(TG_AI_MODE_FILE), { recursive: true });
+        fs.writeFileSync(TG_AI_MODE_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save Telegram AI mode state', { error: e.message });
+    }
+}
+
+function isTgAiEnabledForUser(userId) {
+    return !!tgAiModeState.get(String(userId || ''));
+}
+
+function setTgAiEnabledForUser(userId, enabled) {
+    tgAiModeState.set(String(userId || ''), !!enabled);
+    saveTgAiModeState();
+}
+
+function loadTgAiVibeState() {
+    try {
+        if (!fs.existsSync(TG_AI_VIBE_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_AI_VIBE_FILE, 'utf8'));
+        tgAiVibeState = new Map(Object.entries(raw || {}));
+    } catch (e) {
+        logger.warn('Failed to load Telegram AI vibe state', { error: e.message });
+        tgAiVibeState = new Map();
+    }
+}
+
+function saveTgAiVibeState() {
+    try {
+        const obj = Object.fromEntries(tgAiVibeState.entries());
+        fs.mkdirSync(path.dirname(TG_AI_VIBE_FILE), { recursive: true });
+        fs.writeFileSync(TG_AI_VIBE_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save Telegram AI vibe state', { error: e.message });
+    }
+}
+
+function getAiVibeForNode(userId, sessionKey) {
+    const key = getAiVibeKey(userId, sessionKey);
+    const vibe = String(tgAiVibeState.get(key) || '').toLowerCase();
+    return vibe === 'girl' ? 'girl' : 'guy';
+}
+
+function setAiVibeForNode(userId, sessionKey, vibe) {
+    const key = getAiVibeKey(userId, sessionKey);
+    tgAiVibeState.set(key, vibe === 'girl' ? 'girl' : 'guy');
+    saveTgAiVibeState();
+}
+
+function loadTgAiStickerCache() {
+    try {
+        if (!fs.existsSync(TG_AI_STICKER_CACHE_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(TG_AI_STICKER_CACHE_FILE, 'utf8'));
+        tgAiStickerCache = new Map(Object.entries(raw || {}));
+    } catch (e) {
+        logger.warn('Failed to load Telegram AI sticker cache', { error: e.message });
+        tgAiStickerCache = new Map();
+    }
+}
+
+function saveTgAiStickerCache() {
+    try {
+        const obj = Object.fromEntries(tgAiStickerCache.entries());
+        fs.mkdirSync(path.dirname(TG_AI_STICKER_CACHE_FILE), { recursive: true });
+        fs.writeFileSync(TG_AI_STICKER_CACHE_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('Failed to save Telegram AI sticker cache', { error: e.message });
+    }
+}
+
+function rememberAiStickerFileId(userId, vibe, fileId) {
+    if (!fileId) return;
+    const uid = String(userId || '');
+    const current = tgAiStickerCache.get(uid) || { girl: [], guy: [] };
+    const key = vibe === 'girl' ? 'girl' : 'guy';
+    const list = Array.isArray(current[key]) ? current[key] : [];
+    if (!list.includes(fileId)) list.unshift(fileId);
+    current[key] = list.slice(0, 25);
+    tgAiStickerCache.set(uid, current);
+    saveTgAiStickerCache();
+}
+
+function pickSavedAiStickerFileId(userId, vibe) {
+    const uid = String(userId || '');
+    const current = tgAiStickerCache.get(uid);
+    if (current && Array.isArray(current[vibe]) && current[vibe].length) {
+        return current[vibe][Math.floor(Math.random() * current[vibe].length)];
+    }
+    const pack = stickerPackManager.getUserPack(uid);
+    if (pack && Array.isArray(pack.stickers) && pack.stickers.length) {
+        return pack.stickers[Math.floor(Math.random() * pack.stickers.length)];
+    }
+    return null;
+}
+
+function normalizeDigits(value) {
+    return String(value || '').replace(/[^0-9]/g, '');
+}
+
+function sessionKeyMatchesPhone(sessionKey, phoneNumber) {
+    return normalizeDigits(sessionKey?.split('_')[1] || '') === normalizeDigits(phoneNumber);
+}
+
+function getAccessibleSessionEntries(userId, userRole) {
+    const entries = Array.from(activeSockets.entries());
+    const role = String(userRole || '').toUpperCase();
+    // Only OWNER sees all nodes
+    if (role === 'OWNER') return entries;
+
+    // Everyone else (USER, SUDO, ADMIN) only sees their own paired node
+    const ownedPhone = pairingRegistry.getPhone(String(userId || ''));
+    if (!ownedPhone) return [];
+    return entries.filter(([sessionKey]) => sessionKeyMatchesPhone(sessionKey, ownedPhone));
+}
+
+function resolveTelegramNodeScope(userId, userRole, preferredSessionKey = null) {
+    const entries = getAccessibleSessionEntries(userId, userRole);
+    if (!entries.length) return null;
+
+    if (preferredSessionKey) {
+        const matched = entries.find(([sessionKey]) => sessionKey === preferredSessionKey);
+        if (!matched) return null;
+        return { sessionKey: matched[0], sock: matched[1] };
+    }
+
+    const online = entries.find(([, sock]) => !!sock?.user);
+    const picked = online || entries[0];
+    return picked ? { sessionKey: picked[0], sock: picked[1] } : null;
+}
+
+function makeTelegramTaskId(prefix, userId, sessionKey = '') {
+    return `${prefix}_${String(userId || '0')}_${String(sessionKey || 'none')}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// Expose getter so ai.js can read it
+module.exports._getCustomPrompt = getCustomPrompt;
+
+async function startTelegram() {
+    loadTgAutoUrlState();
+    loadTgAutoDlState();
+    loadTgMusicDlState();
+    loadGroupProtectState();
+    loadTgGroupMembersState();
+    loadTgAiModeState();
+    loadNodeAiPromptState();
+    loadNodeAiApiState();
+    loadGlobalAiSettings();
+    loadTgAiVibeState();
+    loadTgAiStickerCache();
+    loadTgAutoStickerState();
+
+    const bot = new Telegraf(tgBotToken);
+    global.tgBot = bot;
+
+    const rbac = createTelegramRBAC({ ownerTelegramId, logger });
+    await rbac.load();
+
+    const COMMAND_REQUIRED_ROLES = {
+        // ── USER: anyone registered ──────────────────────────────────────────
+        start:        'USER',
+        ai:           'USER',
+        pair:         'USER',
+        preview:      'USER',
+        lp:           'USER',
+        linkpreview:  'USER',
+        cmdplain:     'USER',
+        suggest:      'USER',
+        autosticker:  'USER',
+        mypack:       'USER',
+        sticker:      'USER',
+        rmsession:    'USER',
+        // ── ADMIN: group admins & trusted users (NOT sudo, NOT owner-only) ───
+        // Note: kick/ban/mute etc are admin in GROUP context only — enforced in handler
+        gclink:       'ADMIN',
+        status:       'ADMIN',
+        dm:           'ADMIN',
+        osint:        'ADMIN',
+        nodes:        'ADMIN',
+        nodepanel:    'ADMIN',
+        gprotect:     'ADMIN',
+        kick:         'ADMIN',
+        warn:         'ADMIN',
+        ban:          'ADMIN',
+        mute:         'ADMIN',
+        unmute:       'ADMIN',
+        tagall:       'ADMIN',
+        // ── SUDO: trusted operators (can broadcast, manage group status) ─────
+        castmedia:    'SUDO',
+        gcast:        'SUDO',
+        godcast:      'SUDO',
+        updategstatus:'SUDO',
+        // ── OWNER: full system access ─────────────────────────────────────────
+        queues:       'OWNER',
+        wipequeue:    'OWNER',
+        role:         'OWNER',
+        roles:        'OWNER',
+        supportinbox: 'OWNER',
+        ide:          'ADMIN',
+    };
+
+    const ACTION_REQUIRED_ROLES = [
+        { match: 'menu_main', role: 'USER' },
+        { match: 'menu_path', role: 'USER' },
+        { match: 'cmd_suggest', role: 'USER' },
+        { match: 'support_send_draft', role: 'USER' },
+        { match: 'support_edit_draft', role: 'USER' },
+        { match: 'support_delete_draft', role: 'USER' },
+        { match: 'cmd_support_inbox', role: 'OWNER' },
+        { match: 'support_inbox', role: 'OWNER' },
+        { match: /^support_view_/, role: 'OWNER' },
+        { match: /^support_mark_/, role: 'OWNER' },
+        { match: /^support_remove_/, role: 'OWNER' },
+        { match: /^support_broadcast_/, role: 'OWNER' },
+        { match: 'support_broadcast_send', role: 'OWNER' },
+        { match: 'support_broadcast_edit', role: 'OWNER' },
+        { match: 'support_broadcast_delete', role: 'OWNER' },
+        { match: /^support_filter_/, role: 'OWNER' },
+        { match: /^support_reply_/, role: 'OWNER' },
+        { match: 'support_reply_cancel', role: 'OWNER' },
+        { match: 'help_pair', role: 'USER' },
+        { match: 'toggle_autopair', role: 'OWNER' },
+        { match: 'toggle_tg_ai', role: 'USER' },
+        { match: 'menu_force_join', role: 'OWNER' },
+        { match: 'force_join_check', role: 'USER' },
+        { match: 'fj_toggle', role: 'OWNER' },
+        { match: 'fj_add_link', role: 'OWNER' },
+        { match: 'fj_add_more', role: 'OWNER' },
+        { match: 'fj_delete_all', role: 'OWNER' },
+        { match: /^fj_link_/, role: 'OWNER' },
+        { match: /^fj_link_del_/, role: 'OWNER' },
+        { match: /^fj_link_edit_/, role: 'OWNER' },
+        { match: 'cmd_ai_help', role: 'USER' },
+        { match: /^ux:n:/, role: 'ADMIN' },
+        { match: /^chat_node_/, role: 'USER' },
+        { match: /^node_/, role: 'USER' },
+        { match: 'menu_nodes', role: 'USER' },
+        { match: /^intel_/, role: 'USER' },
+        { match: /^radar_toggle_/, role: 'USER' },
+        { match: /^restart_node_/, role: 'USER' },
+        { match: /^purge_node_/, role: 'OWNER' },
+        { match: /^bcast_node_/, role: 'USER' },
+        { match: /^urltools_node_/, role: 'USER' },
+        { match: /^urltools_toggle_/, role: 'USER' },
+        { match: /^node_ai_prompt_/, role: 'USER' },
+        { match: /^node_ai_api_/, role: 'USER' },
+        { match: 'cmd_global_ai_api', role: 'OWNER' },
+        { match: /^global_ai_api_set_/, role: 'OWNER' },
+        { match: 'cmd_ai_vibe', role: 'OWNER' },
+        { match: /^global_ai_vibe_set_/, role: 'OWNER' },
+        { match: /^menu_song_/, role: 'OWNER' },
+        { match: /^autosticker_toggle_/, role: 'USER' },
+        { match: /^spack_/, role: 'USER' },
+        { match: /^musicmore:/, role: 'USER' },
+        { match: 'menu_group_protect', role: 'USER' },
+        { match: 'group_admin_panel', role: 'ADMIN' },
+        { match: 'group_admin_mute', role: 'ADMIN' },
+        { match: 'group_admin_kick', role: 'ADMIN' },
+        { match: 'group_admin_ban', role: 'ADMIN' },
+        { match: 'group_admin_warn', role: 'ADMIN' },
+        { match: 'group_admin_unmute', role: 'ADMIN' },
+        { match: 'group_admin_tagall', role: 'ADMIN' },
+        { match: /^gp_/, role: 'USER' },
+        { match: /^gw_/, role: 'USER' },
+        { match: 'cmd_guide', role: 'USER' },
+        { match: 'cmd_sticker_panel', role: 'USER' },
+        { match: 'cmd_plain_list', role: 'USER' },
+        { match: /^nexus_node_/, role: 'USER' },
+        { match: /^dm_node_/, role: 'USER' },
+        { match: /^status_node_/, role: 'USER' },
+        { match: /^gstatus_node_/, role: 'USER' },
+        { match: /^setnewgcstatus_node_/, role: 'USER' },
+        { match: /^setnewgcstatus_remove_node_/, role: 'SUDO' },
+        { match: /^node_vibe_toggle_/, role: 'USER' },
+        { match: /^gs_/, role: 'USER' },
+        { match: 'menu_sudo', role: 'SUDO' },
+        { match: 'sudo_add', role: 'OWNER' },
+        { match: 'sudo_remove', role: 'OWNER' },
+        { match: /^sudo_rm_/, role: 'OWNER' },
+        { match: 'cmd_ai_prompt', role: 'OWNER' },
+        { match: 'cmd_ai_prompt_reset', role: 'OWNER' },
+        { match: 'cmd_tg_ai_prompt', role: 'OWNER' },
+        { match: 'cmd_tg_ai_prompt_reset', role: 'OWNER' },
+        { match: 'cmd_wipequeue', role: 'OWNER' },
+        { match: 'cmd_sleep', role: 'OWNER' },
+        { match: 'cmd_wake', role: 'OWNER' },
+        { match: 'cmd_restart', role: 'OWNER' },
+        { match: 'cmd_plugins', role: 'ADMIN' },
+        { match: 'cmd_analytics', role: 'ADMIN' },
+        { match: 'cmd_gclink_help', role: 'ADMIN' },
+        { match: 'ux:noop', role: 'USER' },
+    ];
+
+    const getRequiredRoleForAction = (pattern) => {
+        if (typeof pattern === 'string') {
+            const found = ACTION_REQUIRED_ROLES.find((rule) => typeof rule.match === 'string' && rule.match === pattern);
+            if (found) return found.role;
+
+            const regexMatches = ACTION_REQUIRED_ROLES
+                .filter((rule) => rule.match instanceof RegExp && rule.match.test(pattern))
+                .sort((a, b) => String(b.match.source || '').length - String(a.match.source || '').length);
+            return regexMatches.length ? regexMatches[0].role : 'OWNER';
+        }
+
+        const patternSource = pattern instanceof RegExp ? String(pattern.source || '') : '';
+        const regexRules = ACTION_REQUIRED_ROLES.filter((rule) => rule.match instanceof RegExp);
+
+        // 1) exact regex source match
+        const exact = regexRules.find((rule) => String(rule.match.source || '') === patternSource);
+        if (exact) return exact.role;
+
+        // 2) prefix source match (lets /^node_ai_api_/ cover /^node_ai_api_set_...$/)
+        const prefixMatches = regexRules
+            .filter((rule) => {
+                const ruleSource = String(rule.match.source || '').replace(/\$$/, '');
+                return !!ruleSource && patternSource.startsWith(ruleSource);
+            })
+            .sort((a, b) => String(b.match.source || '').length - String(a.match.source || '').length);
+
+        if (prefixMatches.length) return prefixMatches[0].role;
+        return 'OWNER';
+    };
+
+    const withPermission = (requiredRole, kind, name, handler) => {
+        return async (ctx, ...rest) => {
+            const userId = String(ctx.from?.id || '');
+            const role = rbac.getUserRole(userId);
+            logger.info('[RBAC] Telegram permission check', {
+                userId,
+                role,
+                requiredRole,
+                kind,
+                name,
+            });
+
+            if (!rbac.hasRolePermission(role, requiredRole)) {
+                logger.warn('[RBAC] Telegram permission denied', {
+                    userId,
+                    role,
+                    requiredRole,
+                    kind,
+                    name,
+                });
+
+                if (kind === 'action' && typeof ctx.answerCbQuery === 'function') {
+                    await ctx.answerCbQuery('Access denied.', { show_alert: true }).catch(() => {});
+                }
+
+                if (ctx.chat?.id) {
+                    await ctx.reply('⚠️ Access denied. Your role cannot perform this action.', { parse_mode: 'HTML' }).catch(() => {});
+                }
+                return;
+            }
+
+            return handler(ctx, ...rest);
+        };
+    };
+
+    const rawCommand = bot.command.bind(bot);
+    bot.command = (name, handler) => {
+        const requiredRole = COMMAND_REQUIRED_ROLES[String(name)] || 'OWNER';
+        return rawCommand(name, withPermission(requiredRole, 'command', `/${name}`, handler));
+    };
+
+    const rawAction = bot.action.bind(bot);
+    bot.action = (pattern, handler) => {
+        const requiredRole = getRequiredRoleForAction(pattern);
+        const label = typeof pattern === 'string' ? pattern : String(pattern);
+        return rawAction(pattern, withPermission(requiredRole, 'action', label, handler));
+    };
+
+    const commandRegistry = createCommandRegistry({
+        logger,
+        baseDir: TELEGRAM_COMMANDS_DIR,
+        ownerTelegramId,
+        deps: {
+            logger,
+            activeSockets,
+            startWhatsApp,
+            buildLinkPreview,
+            rbac,
+            // Extended deps for modular command modules
+            ownerTelegramId,
+            ownerManager,
+            broadcastQueue,
+            taskManager,
+            Intel,
+            ai,
+            botState,
+            saveState,
+            os,
+            fsp,
+            getCustomPrompt,
+            saveCustomPrompt,
+            PROMPT_FILE,
+            getDynamicPlugins,
+            getMainDashboardMenu,
+            resolveTelegramNodeScope,
+            gsPlugin,
+        },
+    });
+    commandRegistry.load();
+
+    // Session middleware — required for ctx.session to persist between messages
+    bot.use(session({ defaultSession: () => ({}) }));
+
+    // Attach single resolved role on every update
+    bot.use((ctx, next) => {
+        const userId = String(ctx.from?.id || '');
+        ctx.state = ctx.state || {};
+        ctx.state.userRole = rbac.getUserRole(userId);
+        return next();
+    });
+
+    commandRegistry.registerWithBot(bot);
+
+    const forceJoinCache = new Map();
+    const forceJoinNoticeCooldown = new Map();
+
+    const getForceJoinGateView = (pendingLinks) => {
+        const list = pendingLinks.length
+            ? pendingLinks.map((l, i) => `${i + 1}. <b>${escapeHtml(l.title || l.chatId)}</b>`).join('\n')
+            : '1. <b>Required community</b>';
+        const inline_keyboard = [];
+        pendingLinks.forEach((link) => {
+            if (link.url) {
+                inline_keyboard.push([{ text: `📌 Join ${String(link.title || link.chatId).slice(0, 28)}`, url: link.url }]);
+            }
+        });
+        inline_keyboard.push([{ text: '✅ I Joined, Check Again', callback_data: 'force_join_check', style: 'success' }]);
+        return {
+            text: `🚨 <b>JOIN REQUIRED</b>\n\nYou must join all required channels/groups before using this bot:\n\n${list}\n\n<i>After joining, tap the check button below.</i>`,
+            reply_markup: { inline_keyboard },
+        };
+    };
+
+    bot.use(async (ctx, next) => {
+        const userId = String(ctx.from?.id || '');
+        if (!userId || String(userId) === String(ownerTelegramId)) return next();
+
+        // Force join ONLY fires in private DM chats — never in groups, supergroups or channels
+        const chatType = String(ctx.chat?.type || ctx.message?.chat?.type || '');
+        if (chatType !== 'private') return next();
+
+        const cfg = loadForceJoinConfig();
+        if (!cfg.enabled || !Array.isArray(cfg.links) || cfg.links.length === 0) return next();
+
+        const now = Date.now();
+        const isManualCheck = String(ctx.callbackQuery?.data || '') === 'force_join_check';
+        const cached = forceJoinCache.get(userId);
+        let statuses = null;
+        if (!isManualCheck && cached && (now - cached.ts) < 45000) {
+            statuses = cached.statuses;
+        } else {
+            statuses = await getForceJoinStatus(bot, userId, cfg);
+            forceJoinCache.set(userId, { ts: now, statuses });
+        }
+
+        const missing = statuses.filter((s) => !s.joined);
+        if (missing.length === 0) return next();
+
+        const lastNoticeAt = forceJoinNoticeCooldown.get(userId) || 0;
+        const shouldNotify = now - lastNoticeAt > 20000;
+        forceJoinNoticeCooldown.set(userId, now);
+
+        await removeTelegramUserPairedNode(userId).catch(() => {});
+        const { text, reply_markup } = getForceJoinGateView(missing);
+
+        if (ctx.callbackQuery) {
+            await ctx.answerCbQuery('Join required before using this bot.', { show_alert: true }).catch(() => {});
+            if (shouldNotify) {
+                await ctx.reply(text, { parse_mode: 'HTML', reply_markup, disable_web_page_preview: false }).catch(() => {});
+            }
+            return;
+        }
+
+        if (shouldNotify) {
+            await ctx.reply(text, { parse_mode: 'HTML', reply_markup, disable_web_page_preview: false }).catch(() => {});
+        }
+        return;
+    });
+
+    const getCommandPathView = (userId, isGroup = false, isGroupAdmin = false) => {
+        if (isGroup) {
+            const userRole = rbac.getUserRole(String(userId || ''));
+            const canAdmin = isGroupAdmin || rbac.hasRolePermission(userRole, 'ADMIN');
+            const keyboard = [
+                [{ text: '📖 User Guide', callback_data: 'cmd_guide', style: 'primary' }],
+                [{ text: '🎟️ Sticker Panel', callback_data: 'cmd_sticker_panel', style: 'primary' }],
+                [{ text: '💬 Support / Review', callback_data: 'cmd_suggest', style: 'primary' }],
+            ];
+            if (canAdmin) {
+                keyboard.splice(1, 0,
+                    [{ text: '👑 Admin Panel', callback_data: 'group_admin_panel', style: 'success' }],
+                );
+            }
+            return {
+                text: `🤖 <b>PAPPY ULTIMATE</b>\n\n${canAdmin ? '👑 <b>Admin Panel visible</b>\n' : ''}<i>Mention me or reply to chat.</i>`,
+                reply_markup: { inline_keyboard: keyboard }
+            };
+        }
+        return {
+            text: `🧭 <b>PAPPY ULTIMATE — MENU</b>\n\n<i>Pick a section to navigate.</i>`,
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text: '🏠 Main Hub', callback_data: 'menu_main', style: 'primary' },
+                        { text: '🌐 Nodes', callback_data: 'menu_nodes', style: 'primary' },
+                    ],
+                    [{ text: '🎟️ Sticker Panel', callback_data: 'cmd_sticker_panel', style: 'primary' }],
+                    [
+                        { text: '📖 User Guide', callback_data: 'cmd_guide', style: 'primary' },
+                        { text: '📄 Plain List', callback_data: 'cmd_plain_list', style: 'primary' },
+                    ],
+                    [{ text: '💬 Support / Review', callback_data: 'cmd_suggest', style: 'primary' }],
+                ]
+            }
+        };
+    };
+
+    const getAiStartGreeting = (name) => {
+        const hour = new Date().getHours();
+        const part = hour < 12 ? 'morning' : hour < 18 ? 'afternoon' : 'evening';
+        const who = escapeHtml(name || 'there');
+        return `🤖 <b>PAPPY AI</b>\nHey ${who}, good ${part}. Tag me if you need something, want to ask anything, or just want to chat and vibe. Say <code>pappy hi</code> and I will reply.`;
+    };
+
+    // ==========================================
+    // 🎛️ MAIN MENU ROUTING
+    // ==========================================
+    bot.command('start', async (ctx) => {
+        const userId = String(ctx.from?.id || '');
+        const chatType = String(ctx.chat?.type || '');
+        const isGroup = chatType === 'group' || chatType === 'supergroup';
+        const isGroupAdmin = isGroup ? await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(userId)) : false;
+        const { text, reply_markup } = getCommandPathView(userId, isGroup, isGroupAdmin);
+        if (isGroup) {
+            return ctx.reply(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+        }
+        const greet = getAiStartGreeting(ctx.from?.first_name || ctx.from?.username || 'there');
+        ctx.reply(`${greet}\n\n${text}`, { parse_mode: 'HTML', reply_markup });
+    });
+
+    bot.action('menu_path', async (ctx) => {
+        ctx.answerCbQuery();
+        const userId = String(ctx.from?.id || '');
+        const chatType = String(ctx.chat?.type || '');
+        const isGroup = chatType === 'group' || chatType === 'supergroup';
+        const isGroupAdmin = isGroup ? await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(userId)) : false;
+        const { text, reply_markup } = getCommandPathView(userId, isGroup, isGroupAdmin);
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Path menu');
+    });
+
+    bot.action('menu_main', (ctx) => {
+        ctx.answerCbQuery();
+        const userId = String(ctx.from?.id || '');
+        const chatType = String(ctx.chat?.type || '');
+        const isGroup = chatType === 'group' || chatType === 'supergroup';
+        if (isGroup) {
+            const { text, reply_markup } = getCommandPathView(userId, true);
+            return replyOrEditTelegramView(ctx, text, reply_markup, 'Group menu');
+        }
+        const { text, reply_markup } = getMainDashboardMenu(userId);
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Main hub');
+    });
+
+    bot.action('toggle_auto_dl', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        const current = isAutoDlEnabled(userId);
+        setAutoDlEnabled(userId, !current);
+        const msg = !current
+            ? '⬇️ <b>Auto-Downloader ENABLED</b>\n\nSend any TikTok, YouTube, Instagram, Twitter, Facebook, Reddit, SoundCloud, Spotify, Vimeo or Dailymotion link and I will download it for you.'
+            : '🔴 <b>Auto-Downloader DISABLED</b>\n\nLinks will no longer be auto-downloaded.';
+        await ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {});
+        const { text, reply_markup } = getMainDashboardMenu(userId);
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Main hub').catch(() => {});
+    });
+
+    bot.action('toggle_music_dl', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        const current = isMusicDlEnabled(userId);
+        setMusicDlEnabled(userId, !current);
+        const msg = !current
+            ? '🎵 <b>Music Finder ENABLED</b>\n\nSend me:\n• A <b>song name</b> (e.g. <code>Blinding Lights</code>)\n• A <b>voice note</b> or <b>forwarded audio</b>\n\nI will search YouTube for the top matches and let you pick — then send you the full song + lyrics.'
+            : '🔴 <b>Music Finder DISABLED</b>';
+        await ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {});
+        const { text, reply_markup } = getMainDashboardMenu(userId);
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Main hub').catch(() => {});
+    });
+
+    // ── GROUP ADMIN PANEL ─────────────────────────────────────────────────────
+    const getGroupAdminPanelView = (chatId) => {
+        const cfg = getGroupProtectConfig(String(chatId));
+        const fmt = (v) => v ? 'ON ✅' : 'OFF 🔴';
+        return {
+            text: [
+                '👑 <b>GROUP ADMIN PANEL</b>',
+                '',
+                '<b>🛡️ Auto Protection</b>',
+                '🔗 Anti-Link: <b>' + fmt(cfg.antiLink.enabled) + '</b>',
+                '↪️ Anti-Forward: <b>' + fmt(cfg.antiForward.enabled) + '</b>',
+                '🚫 Anti-Spam: <b>' + fmt(cfg.antiSpam.enabled) + '</b>',
+                '👋 Welcome: <b>' + fmt(cfg.welcome.enabled) + '</b>',
+                '',
+                '<b>🔨 Moderation</b>',
+                'Reply to a user message then use a command:',
+                '<code>/kick</code> — remove user',
+                '<code>/ban</code> — ban user',
+                '<code>/warn [reason]</code> — warn user',
+                '<code>/mute [mins]</code> — mute user',
+                '<code>/unmute</code> — unmute user',
+                '<code>/tagall [msg]</code> — tag everyone',
+            ].join('\n'),
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🛡️ Full Protection Settings', callback_data: 'menu_group_protect', style: 'primary' }],
+                    [
+                        { text: cfg.antiLink.enabled ? '🔴 Anti-Link OFF' : '🟢 Anti-Link ON', callback_data: 'gp_toggle_antilink' },
+                        { text: cfg.antiSpam.enabled ? '🔴 Anti-Spam OFF' : '🟢 Anti-Spam ON', callback_data: 'gp_toggle_antispam' },
+                    ],
+                    [
+                        { text: cfg.antiForward.enabled ? '🔴 Anti-Fwd OFF' : '🟢 Anti-Fwd ON', callback_data: 'gp_toggle_antifwd' },
+                        { text: cfg.welcome.enabled ? '🔴 Welcome OFF' : '🟢 Welcome ON', callback_data: 'gw_toggle' },
+                    ],
+                    [
+                        { text: '👢 Kick', callback_data: 'group_admin_kick', style: 'danger' },
+                        { text: '⛔ Ban', callback_data: 'group_admin_ban', style: 'danger' },
+                        { text: '⚠️ Warn', callback_data: 'group_admin_warn', style: 'primary' },
+                    ],
+                    [
+                        { text: '🔇 Mute', callback_data: 'group_admin_mute', style: 'primary' },
+                        { text: '🔊 Unmute', callback_data: 'group_admin_unmute', style: 'primary' },
+                        { text: '📢 Tag All', callback_data: 'group_admin_tagall', style: 'primary' },
+                    ],
+                    [{ text: '🔙 Back', callback_data: 'menu_path', style: 'primary' }],
+                ]
+            }
+        };
+    };
+
+    bot.action('group_admin_panel', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        if (!isTelegramGroupChat(ctx)) return ctx.reply('⚠️ Use this in a group.').catch(() => {});
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(ctx.from?.id || 0));
+        if (!isAdmin) return ctx.reply('⚠️ Group admin only.', { parse_mode: 'HTML' }).catch(() => {});
+        const { text, reply_markup } = getGroupAdminPanelView(ctx.chat.id);
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Group admin panel');
+    });
+
+    const adminCmdGuard = async (ctx) => {
+        if (!isTelegramGroupChat(ctx)) { await ctx.reply('⚠️ Use this in a group.').catch(() => {}); return false; }
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(ctx.from?.id || 0));
+        if (!isAdmin) { await ctx.reply('⚠️ Group admin only.', { parse_mode: 'HTML' }).catch(() => {}); return false; }
+        return true;
+    };
+
+    bot.action('group_admin_kick', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        if (!await adminCmdGuard(ctx)) return;
+        ctx.reply('👢 <b>Kick</b> — Reply to the user message then send <code>/kick</code>', { parse_mode: 'HTML' }).catch(() => {});
+    });
+    bot.action('group_admin_ban', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        if (!await adminCmdGuard(ctx)) return;
+        ctx.reply('⛔ <b>Ban</b> — Reply to the user message then send <code>/ban</code>', { parse_mode: 'HTML' }).catch(() => {});
+    });
+    bot.action('group_admin_warn', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        if (!await adminCmdGuard(ctx)) return;
+        ctx.reply('⚠️ <b>Warn</b> — Reply to the user message then send <code>/warn [reason]</code>', { parse_mode: 'HTML' }).catch(() => {});
+    });
+    bot.action('group_admin_mute', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        if (!await adminCmdGuard(ctx)) return;
+        ctx.reply('🔇 <b>Mute</b> — Reply to the user message then send <code>/mute [minutes]</code>', { parse_mode: 'HTML' }).catch(() => {});
+    });
+    bot.action('group_admin_unmute', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        if (!await adminCmdGuard(ctx)) return;
+        ctx.reply('🔊 <b>Unmute</b> — Reply to the user message then send <code>/unmute</code>', { parse_mode: 'HTML' }).catch(() => {});
+    });
+    bot.action('group_admin_tagall', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        if (!await adminCmdGuard(ctx)) return;
+        ctx.reply('📢 <b>Tag All</b> — Send <code>/tagall [your message]</code>', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+        bot.action('menu_group_protect', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        if (!isTelegramGroupChat(ctx)) {
+            return ctx.reply('🛡️ Open this in your Telegram group with <code>/gprotect</code>.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const userId = Number(ctx.from?.id || 0);
+        const userRole = ctx.state?.userRole || rbac.getUserRole(String(ctx.from?.id || ''));
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, userId);
+        if (!isAdmin && !rbac.hasRolePermission(userRole, 'ADMIN')) {
+            return ctx.reply('⚠️ Group admin access required.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const cfg = getGroupProtectConfig(String(ctx.chat.id));
+        const view = getGroupProtectionView(String(ctx.chat.id), cfg);
+        return replyOrEditTelegramView(ctx, view.text, view.reply_markup, 'Group protection');
+    });
+
+    bot.action(/^gp_toggle_(antilink|antifwd|antispam)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        if (!isTelegramGroupChat(ctx)) return;
+        const chatId = String(ctx.chat.id);
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(ctx.from?.id || 0));
+        if (!isAdmin) return ctx.reply('⚠️ Group admin only.', { parse_mode: 'HTML' }).catch(() => {});
+
+        const key = ctx.match[1];
+        const cfg = getGroupProtectConfig(chatId);
+        if (key === 'antilink') cfg.antiLink.enabled = !cfg.antiLink.enabled;
+        if (key === 'antifwd') cfg.antiForward.enabled = !cfg.antiForward.enabled;
+        if (key === 'antispam') cfg.antiSpam.enabled = !cfg.antiSpam.enabled;
+        setGroupProtectConfig(chatId, cfg);
+        const view = getGroupProtectionView(chatId, cfg);
+        return replyOrEditTelegramView(ctx, view.text, view.reply_markup, 'Group protection');
+    });
+
+    bot.action(/^gp_actionmenu_(antilink|antifwd|antispam)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        if (!isTelegramGroupChat(ctx)) return;
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(ctx.from?.id || 0));
+        if (!isAdmin) return ctx.reply('⚠️ Group admin only.', { parse_mode: 'HTML' }).catch(() => {});
+        const key = ctx.match[1];
+        const title = key === 'antilink' ? 'Anti-Link' : key === 'antifwd' ? 'Anti-Forward' : 'Anti-Spam';
+        return ctx.reply(
+            `⚙️ <b>${title} Action</b>\nPick what to do when violated:`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '🗑 Delete', callback_data: `gp_setaction:${key}:delete` },
+                            { text: '⚠️ Warn', callback_data: `gp_setaction:${key}:warn` },
+                        ],
+                        [
+                            { text: '👢 Kick', callback_data: `gp_setaction:${key}:kick` },
+                            { text: '⛔ Ban', callback_data: `gp_setaction:${key}:ban` },
+                        ],
+                        [
+                            { text: '🔇 Mute', callback_data: `gp_setaction:${key}:mute` },
+                            { text: '🔙 Back', callback_data: 'gp_refresh' },
+                        ],
+                    ]
+                }
+            }
+        ).catch(() => {});
+    });
+
+    bot.action(/^gp_setaction:(antilink|antifwd|antispam):(delete|warn|kick|ban|mute)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        if (!isTelegramGroupChat(ctx)) return;
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(ctx.from?.id || 0));
+        if (!isAdmin) return ctx.reply('⚠️ Group admin only.', { parse_mode: 'HTML' }).catch(() => {});
+        const key = ctx.match[1];
+        const action = ctx.match[2];
+        const cfg = getGroupProtectConfig(String(ctx.chat.id));
+        if (key === 'antilink') cfg.antiLink.action = action;
+        if (key === 'antifwd') cfg.antiForward.action = action;
+        if (key === 'antispam') cfg.antiSpam.action = action;
+        setGroupProtectConfig(String(ctx.chat.id), cfg);
+        const view = getGroupProtectionView(String(ctx.chat.id), cfg);
+        return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+    });
+
+    bot.action('gp_refresh', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        if (!isTelegramGroupChat(ctx)) return;
+        const cfg = getGroupProtectConfig(String(ctx.chat.id));
+        const view = getGroupProtectionView(String(ctx.chat.id), cfg);
+        return replyOrEditTelegramView(ctx, view.text, view.reply_markup, 'Group protection');
+    });
+
+    bot.action('gw_toggle', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        if (!isTelegramGroupChat(ctx)) return;
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(ctx.from?.id || 0));
+        if (!isAdmin) return ctx.reply('⚠️ Group admin only.', { parse_mode: 'HTML' }).catch(() => {});
+        const cfg = getGroupProtectConfig(String(ctx.chat.id));
+        cfg.welcome.enabled = !cfg.welcome.enabled;
+        setGroupProtectConfig(String(ctx.chat.id), cfg);
+        const view = getGroupProtectionView(String(ctx.chat.id), cfg);
+        return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+    });
+
+    bot.action('gw_ai_toggle', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        if (!isTelegramGroupChat(ctx)) return;
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(ctx.from?.id || 0));
+        if (!isAdmin) return ctx.reply('⚠️ Group admin only.', { parse_mode: 'HTML' }).catch(() => {});
+        const cfg = getGroupProtectConfig(String(ctx.chat.id));
+        cfg.welcome.useAi = !cfg.welcome.useAi;
+        setGroupProtectConfig(String(ctx.chat.id), cfg);
+        const view = getGroupProtectionView(String(ctx.chat.id), cfg);
+        return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+    });
+
+    bot.action(/^gw_media_(photo|video|audio|clear)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        if (!isTelegramGroupChat(ctx)) return;
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(ctx.from?.id || 0));
+        if (!isAdmin) return ctx.reply('⚠️ Group admin only.', { parse_mode: 'HTML' }).catch(() => {});
+
+        const mode = ctx.match[1];
+        const chatId = String(ctx.chat.id);
+        const cfg = getGroupProtectConfig(chatId);
+        if (mode === 'clear') {
+            cfg.welcome.media = { type: '', fileId: '' };
+            setGroupProtectConfig(chatId, cfg);
+            const view = getGroupProtectionView(chatId, cfg);
+            return ctx.reply('🗑 Welcome media cleared.', { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingWelcomeMedia = { chatId, type: mode };
+        return ctx.reply(
+            mode === 'audio'
+                ? '🎵 Send an audio now in this group to set as welcome song.'
+                : mode === 'video'
+                    ? '🎥 Send a video now in this group to set as welcome clip.'
+                    : '🖼 Send a photo now in this group to set as welcome image.',
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+    });
+
+    bot.action(/^musicmore:([^:]+):(\d+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const token = String(ctx.match[1] || '');
+        const page = Math.max(0, Number(ctx.match[2] || 0));
+        const userId = String(ctx.from?.id || '');
+        const remembered = getRememberedMusicSearch(token, userId);
+        if (!remembered) {
+            return ctx.reply('⚠️ Search session expired. Send the song name again.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        try {
+            const { results, hasMore } = await searchSongs(remembered.query, page);
+            if (!results.length) {
+                return ctx.reply('❌ No more results found.', { parse_mode: 'HTML' }).catch(() => {});
+            }
+            const inline_keyboard = results.map((r, i) => [{
+                text: `${page * 5 + i + 1}. ${r.title.slice(0, 38)} — ${r.uploader.slice(0, 18)} [${r.duration}]`,
+                callback_data: `musicpick:${/\bvideo\b/i.test(remembered.query) ? 'v:' : ''}${r.videoId}`,
+            }]);
+            const nav = [];
+            if (page > 0) nav.push({ text: '⬅️ Prev', callback_data: `musicmore:${token}:${page - 1}` });
+            if (hasMore) nav.push({ text: '➡️ Next', callback_data: `musicmore:${token}:${page + 1}` });
+            if (nav.length) inline_keyboard.push(nav);
+            const pollText = `🎵 <b>Results for:</b> <i>${escapeHtml(remembered.query)}</i>  <b>(page ${page + 1})</b>`;
+            await ctx.editMessageText(pollText, { parse_mode: 'HTML', reply_markup: { inline_keyboard } })
+                .catch(() => ctx.reply(pollText, { parse_mode: 'HTML', reply_markup: { inline_keyboard } }));
+        } catch (err) {
+            logger.warn('[MusicDL] More results failed', { query: remembered.query, error: err.message });
+            await ctx.reply(`❌ Could not load more songs: <code>${escapeHtml(err.message)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+        }
+    });
+
+    // Extract audio from a previously downloaded video
+    bot.action(/^extract_audio:(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const url = decodeURIComponent(ctx.match[1]);
+        const statusMsg = await ctx.reply('🎵 <b>Extracting audio from video...</b>', { parse_mode: 'HTML' }).catch(() => null);
+        try {
+            await downloadAndSendSong(ctx, url, statusMsg, null);
+            await editStatus(ctx, statusMsg, '✅ Audio extracted!');
+            setTimeout(() => { if (statusMsg?.message_id) ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {}); }, 3000);
+        } catch (err) {
+            await editStatus(ctx, statusMsg, `❌ Extract failed: <code>${escapeHtml(err.message)}</code>`);
+        }
+    });
+
+    // User picks a song from search results
+    // callback_data format: musicpick:<videoId>  (audio) or musicpick:v:<videoId>  (video)
+    bot.action(/^musicpick:([^:]+)(?::(.+))?$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const first = ctx.match[1];
+        const wantVideo = first === 'v';
+        const videoId = wantVideo ? (ctx.match[2] || '') : first;
+        const rawTitle = wantVideo ? 'Selected video' : decodeURIComponent(ctx.match[2] || 'Selected song');
+        const url = `https://www.youtube.com/watch?v=${videoId}`;
+        const statusMsg = await ctx.reply(
+            `${wantVideo ? '🎬' : '🎵'} <b>${escapeHtml(rawTitle)}</b>\n\n⏳ <i>Downloading...</i>`,
+            { parse_mode: 'HTML' }
+        ).catch(() => null);
+        try {
+            await downloadAndSendSong(ctx, url, statusMsg, rawTitle, wantVideo);
+            await editStatus(ctx, statusMsg, `✅ Done — <b>${escapeHtml(rawTitle)}</b>`);
+            setTimeout(() => { if (statusMsg?.message_id) ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {}); }, 4000);
+        } catch (err) {
+            logger.warn('[MusicDL] Pick failed', { url, error: err.message });
+            await editStatus(ctx, statusMsg, `❌ Failed: <code>${escapeHtml(err.message)}</code>`);
+        }
+    });
+
+    bot.action(/^musiclyrics:([^:]+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const token = String(ctx.match[1] || '');
+        const userId = String(ctx.from?.id || '');
+        const remembered = getRememberedLyricsRequest(token, userId);
+        if (!remembered) {
+            return ctx.reply('⚠️ Lyrics request expired. Download the song again and tap Add Lyrics.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        const statusMsg = await ctx.reply('📝 <b>Fetching lyrics...</b>', { parse_mode: 'HTML' }).catch(() => null);
+        try {
+            const lyrics = await fetchLyrics(remembered.title, remembered.artist);
+            if (!lyrics) {
+                await editStatus(ctx, statusMsg, `❌ No lyrics found for <b>${escapeHtml(remembered.title)}</b>.`);
+                return;
+            }
+            await editStatus(ctx, statusMsg, `📜 <b>Lyrics — ${escapeHtml(remembered.title)}</b>\n\n<code>${escapeHtml(lyrics)}</code>`);
+        } catch (err) {
+            await editStatus(ctx, statusMsg, `❌ Lyrics failed: <code>${escapeHtml(err.message || String(err))}</code>`);
+        }
+    });
+
+    bot.action('menu_song_panel', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const { text, reply_markup } = getMenuSongStudioView();
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Menu song studio');
+    });
+
+    bot.action('menu_song_set', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingMenuSongUploadMode = 'set';
+        return ctx.reply(
+            '🎵 <b>Set Main Menu Song</b>\n\nSend an audio/voice/audio-file now.\nOptional: add caption as song name.\n\nSend <code>/cancel</code> to stop.',
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+    });
+
+    bot.action('menu_song_add', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingMenuSongUploadMode = 'add';
+        return ctx.reply(
+            '➕ <b>Add Menu Song</b>\n\nSend an audio/voice/audio-file now.\nOptional: add caption as song name.\n\nSend <code>/cancel</code> to stop.',
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+    });
+
+    bot.action('menu_song_next', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const nextSong = menuSongManager.switchActive(1);
+        const { text, reply_markup } = getMenuSongStudioView();
+        const prefix = nextSong ? `✅ Switched to: <b>${escapeHtml(nextSong.name)}</b>\n\n` : '⚠️ No songs in library yet.\n\n';
+        return replyOrEditTelegramView(ctx, `${prefix}${text}`, reply_markup, 'Menu song switch');
+    });
+
+    bot.action('menu_song_prev', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const prevSong = menuSongManager.switchActive(-1);
+        const { text, reply_markup } = getMenuSongStudioView();
+        const prefix = prevSong ? `✅ Switched to: <b>${escapeHtml(prevSong.name)}</b>\n\n` : '⚠️ No songs in library yet.\n\n';
+        return replyOrEditTelegramView(ctx, `${prefix}${text}`, reply_markup, 'Menu song switch');
+    });
+
+    bot.action('menu_song_rename', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const activeSong = menuSongManager.getActiveSong();
+        if (!activeSong) return ctx.reply('⚠️ No active song to rename. Add a song first.', { parse_mode: 'HTML' }).catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingMenuSongRenameId = activeSong.id;
+        return ctx.reply(
+            `✏️ <b>Rename Active Song</b>\nCurrent: <b>${escapeHtml(activeSong.name)}</b>\n\nSend new name now.`,
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+    });
+
+    bot.action('menu_song_delete', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const activeSong = menuSongManager.getActiveSong();
+        if (!activeSong) return ctx.reply('⚠️ No active song to delete.', { parse_mode: 'HTML' }).catch(() => {});
+        menuSongManager.deleteSong(activeSong.id);
+        const { text, reply_markup } = getMenuSongStudioView();
+        return replyOrEditTelegramView(ctx, `🗑 Deleted: <b>${escapeHtml(activeSong.name)}</b>\n\n${text}`, reply_markup, 'Menu song delete');
+    });
+
+    const getForceJoinManagerView = () => {
+        const cfg = loadForceJoinConfig();
+        const links = Array.isArray(cfg.links) ? cfg.links : [];
+        const lines = links.length
+            ? links.map((l, i) => `${i + 1}. <b>${escapeHtml(l.title || l.chatId)}</b> <code>${escapeHtml(l.chatId)}</code>`).join('\n')
+            : '<i>No links configured yet.</i>';
+
+        const inline_keyboard = [
+            [{ text: cfg.enabled ? '🛑 Disable Force Join' : '✅ Enable Force Join', callback_data: 'fj_toggle', style: cfg.enabled ? 'danger' : 'success' }],
+            [
+                { text: '➕ Add Force Join Link', callback_data: 'fj_add_link', style: 'success' },
+                { text: '➕ Add More Links', callback_data: 'fj_add_more', style: 'primary' },
+            ],
+        ];
+
+        links.forEach((link, idx) => {
+            inline_keyboard.push([{ text: `🔗 Link ${idx + 1}: ${(link.title || link.chatId).slice(0, 26)}`, callback_data: `fj_link_${link.id}`, style: 'primary' }]);
+        });
+
+        inline_keyboard.push([{ text: '🗑 Delete All Links', callback_data: 'fj_delete_all', style: 'danger' }]);
+        inline_keyboard.push([{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }]);
+
+        return {
+            text: `🔐 <b>FORCE JOIN MANAGER</b>\n\nStatus: <b>${cfg.enabled ? 'ENABLED ✅' : 'DISABLED 🔴'}</b>\nRequired links: <b>${links.length}</b>\n\n${lines}\n\n<i>Tip: Forward any message from your target group/channel to auto-capture chat id.</i>`,
+            reply_markup: { inline_keyboard },
+        };
+    };
+
+    bot.action('menu_force_join', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const { text, reply_markup } = getForceJoinManagerView();
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action('fj_toggle', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const cfg = loadForceJoinConfig();
+        cfg.enabled = !cfg.enabled;
+        saveForceJoinConfig(cfg);
+        const { text, reply_markup } = getForceJoinManagerView();
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action('fj_add_link', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingForceJoinAdd = true;
+        ctx.session.awaitingForceJoinEditId = null;
+        return ctx.reply(
+            '📥 <b>Add Force Join Link</b>\n\nSend one of:\n• Forwarded message from target group/channel\n• <code>@username</code>\n• <code>https://t.me/username</code>\n• <code>-1001234567890|https://t.me/+invite|My Group</code>',
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+    });
+
+    bot.action('fj_add_more', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingForceJoinAdd = true;
+        ctx.session.awaitingForceJoinEditId = null;
+        return ctx.reply('➕ Send another force-join target now (same formats as add).', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action('fj_delete_all', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const cfg = loadForceJoinConfig();
+        cfg.links = [];
+        cfg.enabled = false;
+        saveForceJoinConfig(cfg);
+        const { text, reply_markup } = getForceJoinManagerView();
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action(/^fj_link_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const linkId = String(ctx.match[1] || '');
+        const cfg = loadForceJoinConfig();
+        const link = (cfg.links || []).find((l) => l.id === linkId);
+        if (!link) {
+            return ctx.reply('⚠️ Force-join link not found.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        return ctx.editMessageText(
+            `🔗 <b>FORCE JOIN LINK</b>\n\nTitle: <b>${escapeHtml(link.title || link.chatId)}</b>\nChat: <code>${escapeHtml(link.chatId)}</code>\nURL: <code>${escapeHtml(link.url || '(none)')}</code>`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '✏️ Change Link', callback_data: `fj_link_edit_${link.id}`, style: 'primary' },
+                            { text: '🗑 Delete Link', callback_data: `fj_link_del_${link.id}`, style: 'danger' },
+                        ],
+                        [{ text: '🔙 Back to Force Join', callback_data: 'menu_force_join', style: 'primary' }],
+                    ],
+                },
+            }
+        ).catch(() => {});
+    });
+
+    bot.action(/^fj_link_del_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const linkId = String(ctx.match[1] || '');
+        const cfg = loadForceJoinConfig();
+        cfg.links = (cfg.links || []).filter((l) => l.id !== linkId);
+        if (cfg.links.length === 0) cfg.enabled = false;
+        saveForceJoinConfig(cfg);
+        const { text, reply_markup } = getForceJoinManagerView();
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action(/^fj_link_edit_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const linkId = String(ctx.match[1] || '');
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingForceJoinEditId = linkId;
+        ctx.session.awaitingForceJoinAdd = false;
+        return ctx.reply('✏️ <b>Edit Force Join Link</b>\nSend replacement target now (forward message or text format).', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action('force_join_check', async (ctx) => {
+        const userId = String(ctx.from?.id || '');
+        const cfg = loadForceJoinConfig();
+        const statuses = await getForceJoinStatus(bot, userId, cfg);
+        const missing = statuses.filter((s) => !s.joined);
+        if (missing.length === 0) {
+            ctx.answerCbQuery().catch(() => {});
+            const { text, reply_markup } = getCommandPathView(userId);
+            return ctx.reply(`✅ <b>Verified!</b> You can now use the bot.\n\n${text}`, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+        }
+        ctx.answerCbQuery('Still missing required joins.', { show_alert: true }).catch(() => {});
+        const gate = getForceJoinGateView(missing);
+        return ctx.reply(gate.text, { parse_mode: 'HTML', reply_markup: gate.reply_markup }).catch(() => {});
+    });
+
+    bot.action('toggle_autopair', (ctx) => {
+        botState.autoPairEnabled = !botState.autoPairEnabled;
+        saveState();
+        const status = botState.autoPairEnabled ? '✅ AUTO-PAIR ENABLED' : '❌ AUTO-PAIR DISABLED';
+        ctx.answerCbQuery(status);
+        const userId = String(ctx.from?.id || '');
+        const { text, reply_markup } = getMainDashboardMenu(userId);
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action('toggle_tg_ai', (ctx) => {
+        const userId = String(ctx.from?.id || '');
+        const next = !isTgAiEnabledForUser(userId);
+        setTgAiEnabledForUser(userId, next);
+        ctx.answerCbQuery(next ? 'Telegram AI ON' : 'Telegram AI OFF').catch(() => {});
+        const text = next
+            ? '🟢 <b>Telegram AI mode is ON.</b> I will reply to your normal messages here.'
+            : '🔴 <b>Telegram AI mode is OFF.</b>';
+        ctx.reply(text, { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action('cmd_suggest', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.supportCompose = true;
+        ctx.session.supportDraft = null;
+        const { text, reply_markup } = getSupportComposeView();
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Support compose');
+    });
+
+    bot.action('support_send_draft', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const draft = ctx.session?.supportDraft || null;
+        if (!draft) return ctx.reply('⚠️ No support draft to send.', { parse_mode: 'HTML' }).catch(() => {});
+
+        const entry = upsertSupportEntry({
+            id: makeSupportEntryId(),
+            userId: String(ctx.from?.id || ''),
+            name: ctx.from?.first_name || ctx.from?.username || 'Unknown',
+            username: ctx.from?.username || '',
+            text: draft.text || '',
+            caption: draft.caption || '',
+            mediaType: draft.mediaType || 'text',
+            fileId: draft.fileId || null,
+            fileName: draft.fileName || null,
+            mimeType: draft.mimeType || null,
+            createdAt: Date.now(),
+            status: 'new',
+        });
+
+        ctx.session.supportCompose = false;
+        ctx.session.supportDraft = null;
+
+        try {
+            await bot.telegram.sendMessage(ownerTelegramId, `📩 <b>New support message</b>\nFrom: <b>${escapeHtml(entry.name)}</b>\nType: <b>${escapeHtml(entry.mediaType)}</b>`, {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '📥 Open Inbox', callback_data: 'cmd_support_inbox', style: 'primary' }, { text: '👁 View Entry', callback_data: `support_view_${entry.id}`, style: 'primary' }]] }
+            });
+
+            if (entry.mediaType === 'photo' && entry.fileId) {
+                await bot.telegram.sendPhoto(ownerTelegramId, entry.fileId, { caption: `From ${entry.name}\n${entry.caption || entry.text || ''}`.slice(0, 1024) }).catch(() => {});
+            } else if (entry.mediaType === 'video' && entry.fileId) {
+                await bot.telegram.sendVideo(ownerTelegramId, entry.fileId, { caption: `From ${entry.name}\n${entry.caption || entry.text || ''}`.slice(0, 1024) }).catch(() => {});
+            } else if (entry.mediaType === 'document' && entry.fileId) {
+                await bot.telegram.sendDocument(ownerTelegramId, entry.fileId, { caption: `From ${entry.name}\n${entry.caption || entry.text || ''}`.slice(0, 1024) }).catch(() => {});
+            } else if (entry.text) {
+                await bot.telegram.sendMessage(ownerTelegramId, `📝 ${entry.name}:\n${entry.text}`.slice(0, 4096)).catch(() => {});
+            }
+        } catch (e) {
+            logger.warn('Owner support notify failed', { error: e.message });
+        }
+
+        return ctx.reply('✅ Your message has been sent to support. We will review it soon.', {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Path', callback_data: 'menu_path', style: 'primary' }]] }
+        }).catch(() => {});
+    });
+
+    bot.action('support_edit_draft', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.supportCompose = true;
+        const { text, reply_markup } = getSupportComposeView();
+        return ctx.editMessageText(`${text}\n\n<i>Send your updated text/media now.</i>`, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action('support_delete_draft', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.supportCompose = false;
+        ctx.session.supportDraft = null;
+        return ctx.reply('🗑 Support draft deleted.', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    const openSupportInbox = (ctx, filter = 'all') => {
+        const { text, reply_markup } = getSupportInboxView(filter);
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Support inbox');
+    };
+
+    bot.action('cmd_support_inbox', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        return openSupportInbox(ctx, 'all');
+    });
+
+    bot.action('support_inbox', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        return openSupportInbox(ctx, 'all');
+    });
+
+    bot.action(/^support_filter_(all|new|reviewed)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const filter = ctx.match[1];
+        return openSupportInbox(ctx, filter);
+    });
+
+    bot.action(/^support_reply_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const entryId = ctx.match[1];
+        if (entryId === 'cancel') {
+            ctx.session = ctx.session || {};
+            ctx.session.awaitingSupportReplyEntryId = null;
+            ctx.session.awaitingSupportReplyUserId = null;
+            return ctx.reply('Reply cancelled.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const entry = getSupportEntry(entryId);
+        if (!entry) return ctx.answerCbQuery('Entry not found.', { show_alert: true }).catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingSupportReplyEntryId = entry.id;
+        ctx.session.awaitingSupportReplyUserId = entry.userId;
+        return ctx.reply(
+            `💬 <b>Reply to ${escapeHtml(entry.name || 'User')}</b>\n\nType your reply now. It will be sent directly to the user.`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'support_reply_cancel', style: 'danger' }]] } }
+        ).catch(() => {});
+    });
+
+    bot.action('support_reply_cancel', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingSupportReplyEntryId = null;
+        ctx.session.awaitingSupportReplyUserId = null;
+        return ctx.reply('Reply cancelled.', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action(/^support_view_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const entry = getSupportEntry(ctx.match[1]);
+        if (!entry) return ctx.reply('❌ Entry not found.', { parse_mode: 'HTML' }).catch(() => {});
+        const { text, reply_markup } = getSupportEntryView(entry);
+        await replyOrEditTelegramView(ctx, text, reply_markup, 'Support entry');
+
+        if (entry.mediaType === 'photo' && entry.fileId) {
+            return ctx.replyWithPhoto(entry.fileId, { caption: `From ${entry.name}\n${entry.caption || entry.text || ''}`.slice(0, 1024) }).catch(() => {});
+        }
+        if (entry.mediaType === 'video' && entry.fileId) {
+            return ctx.replyWithVideo(entry.fileId, { caption: `From ${entry.name}\n${entry.caption || entry.text || ''}`.slice(0, 1024) }).catch(() => {});
+        }
+        if (entry.mediaType === 'document' && entry.fileId) {
+            return ctx.replyWithDocument(entry.fileId, { caption: `From ${entry.name}\n${entry.caption || entry.text || ''}`.slice(0, 1024) }).catch(() => {});
+        }
+        return ctx.reply(`📝 ${entry.name}:\n${entry.text || entry.caption || ''}`.slice(0, 4096)).catch(() => {});
+    });
+
+    bot.action(/^support_mark_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const entry = getSupportEntry(ctx.match[1]);
+        if (!entry) return ctx.reply('❌ Entry not found.', { parse_mode: 'HTML' }).catch(() => {});
+        entry.status = 'reviewed';
+        upsertSupportEntry(entry);
+        const { text, reply_markup } = getSupportEntryView(entry);
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Support mark reviewed');
+    });
+
+    bot.action(/^support_remove_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        deleteSupportEntry(ctx.match[1]);
+        const { text, reply_markup } = getSupportInboxView('all');
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Support delete');
+    });
+
+    bot.action(/^support_broadcast_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingSupportBroadcastEntryId = ctx.match[1];
+        ctx.session.supportBroadcastDraft = null;
+        return ctx.reply('📢 Type the broadcast/news text now. After that you will get Send / Edit / Delete buttons.', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action('support_broadcast_edit', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.supportBroadcastDraft = null;
+        return ctx.reply('✏️ Send the updated broadcast text now.', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action('support_broadcast_delete', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingSupportBroadcastEntryId = null;
+        ctx.session.supportBroadcastDraft = null;
+        return ctx.reply('🗑 Broadcast draft deleted.', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action('support_broadcast_send', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const draft = String(ctx.session?.supportBroadcastDraft || '').trim();
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!draft) return ctx.reply('⚠️ No broadcast draft available.', { parse_mode: 'HTML' }).catch(() => {});
+        const scoped = resolveTelegramNodeScope(userId, userRole, ctx.session?.activeChatNode || undefined);
+        const sock = scoped?.sock || null;
+        if (!sock?.user) return ctx.reply('❌ No active WhatsApp node available for broadcast.', { parse_mode: 'HTML' }).catch(() => {});
+        const targetPlugin = PLUGIN_REGISTRY.get('.gcast');
+        if (!targetPlugin) return ctx.reply('❌ Broadcast plugin not available.', { parse_mode: 'HTML' }).catch(() => {});
+
+        const botId = sock.user.id.split(':')[0];
+        const mockMsg = {
+            key: { remoteJid: `${botId}@s.whatsapp.net`, fromMe: false, id: `TG_SUPPORT_BCAST_${Date.now()}` },
+            message: { conversation: `.gcast ${draft}` },
+            pushName: 'Telegram'
+        };
+        const mockUser = { role: 'owner', name: 'Telegram', stats: { commandsUsed: 0 }, activity: { isBanned: false } };
+        ctx.session.supportBroadcastDraft = null;
+        ctx.session.awaitingSupportBroadcastEntryId = null;
+        taskManager.submit(makeTelegramTaskId('TG_SUPPORT_BCAST', userId, scoped?.sessionKey), async (abortSignal) => {
+            await targetPlugin.execute({ sock, msg: mockMsg, args: draft.split(/ +/), text: `.gcast ${draft}`, user: mockUser, botId, abortSignal });
+        }, { priority: 5, timeout: 180000 }).catch(err => ctx.reply(`❌ ${err.message}`, { parse_mode: 'HTML' }));
+        return ctx.reply('📢 Quick news broadcast started.', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    // ==========================================
+    // 🌐 ACTIVE NODES SUBMENU
+    // ==========================================
+    bot.action('menu_nodes', (ctx) => {
+        ctx.answerCbQuery();
+        const chatType = String(ctx.chat?.type || '');
+        if (chatType === 'group' || chatType === 'supergroup') {
+            return ctx.reply('⚠️ Node management is only available in DM.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        const accessibleEntries = getAccessibleSessionEntries(userId, userRole);
+
+        if (accessibleEntries.length === 0) {
+            return ctx.editMessageText('🔴 <b>NO ACTIVE SESSIONS</b>\nClick "Deploy Node" on the main menu to pair a number.', { 
+                parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Path', callback_data: 'menu_path', style: 'primary' }]] }
+            }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+        }
+        
+        const inline_keyboard = [];
+        accessibleEntries.forEach(([key, sock]) => {
+            const phone = key.split('_')[1] || key;
+            const status = sock?.user ? '🟢' : '⏳';
+            inline_keyboard.push([{ text: `${status} Node +${phone}`, callback_data: `node_${key}`, style: 'primary' }]);
+        });
+        inline_keyboard.push([{ text: '🔙 Back to Path', callback_data: 'menu_path', style: 'primary' }]);
+
+        ctx.editMessageText('🌐 <b>SELECT A NODE TO MANAGE:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard } }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    const getStickerPanelView = (userId) => {
+        const enabled = getAutoStickerStateForUser(userId);
+        return {
+            text: `🎟️ <b>AUTO STICKER CONTROL</b>\n\nStatus: <b>${enabled ? '🟢 ON' : '🔴 OFF'}</b>\n\nWhen ON, incoming Telegram photo/video is auto-converted to sticker.\nUse <code>#url</code> in caption to force URL output instead.`,
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text: '🟢 Turn ON', callback_data: 'autosticker_toggle_on', style: 'success' },
+                        { text: '🔴 Turn OFF', callback_data: 'autosticker_toggle_off', style: 'danger' },
+                    ],
+                    [{ text: '🔙 Back to Path', callback_data: 'menu_path', style: 'primary' }],
+                ]
+            }
+        };
+    };
+
+    const getPlainListView = (userId = '') => {
+        const isOwner = String(userId || '') === String(ownerTelegramId || '');
+        const back = { reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Path', callback_data: 'menu_path', style: 'primary' }]] } };
+        const pages = [
+            [
+                '📄 <b>PAPPY — TELEGRAM COMMANDS</b>',
+                '',
+                '<b>📱 Navigation</b>',
+                '• /start — open menu',
+                '• /cmdplain — this plain list',
+                '• /nodes — your node list',
+                '• /exitchat — leave chat mode',
+                '',
+                '<b>🎵 Music & Media</b>',
+                '• Send a song name — Music Finder picks top results',
+                '• Add "video" in query — downloads video instead of audio',
+                '• /autosticker on|off — toggle auto sticker',
+                '• /sticker — sticker tools panel',
+                '• /mypack — view your sticker pack',
+                '',
+                '<b>🛡️ Group Tools (Admin)</b>',
+                '• /kick — kick a user',
+                '• /ban — ban a user',
+                '• /warn — warn a user',
+                '• /mute — mute a user',
+                '• /unmute — unmute a user',
+                '• /tagall — tag all members',
+                '• /gprotect — group protection panel',
+                '• /gclink <jid> — get group invite link',
+            ].join('\n'),
+            [
+                '📄 <b>PAPPY — WHATSAPP COMMANDS</b>',
+                '',
+                '<b>🎵 Music</b>',
+                '• .play [song] — download & send audio',
+                '• .video [search] — download & send video',
+                '',
+                '<b>🤖 AI</b>',
+                '• .pappy on/off — enable/disable AI in group',
+                '• .img [prompt] — generate AI image',
+                '• .tts [text] — text to speech',
+                '',
+                '<b>🎨 Stickers</b>',
+                '• .sticker — convert image/video to sticker',
+                '',
+                '<b>📡 Broadcast (Sudo)</b>',
+                '• .gcast [msg] — broadcast to all groups',
+                '• .godcast [msg] — premium broadcast',
+                '• .schedulecast [time] [msg] — schedule broadcast',
+                '',
+                '<b>🛡️ Group Admin</b>',
+                '• .tag [msg] — tag all members',
+                '• .promote / .demote — admin control',
+                '• .kick / .ban / .warn — moderation',
+                '• .mute / .unmute — lock/unlock chat',
+                '• .antilink on/off — block links',
+                '• .antidemote on/off — prevent demotion',
+                '• .tourl — reply to media for direct URL',
+                '',
+                '<b>⚙️ Owner</b>',
+                '• .sleep / .wake — pause/resume bot',
+                '• .prefix [char] — change command prefix',
+                '• .nodemode public/private — set node access mode',
+            ].join('\n'),
+        ];
+        if (isOwner) {
+            pages.push([
+                '📄 <b>PAPPY — OWNER PANEL</b>',
+                '',
+                '<b>🔧 System</b>',
+                '• /supportinbox — open support inbox',
+                '• Restart Entire System — in Main Hub',
+                '• Sleep / Wake Engine — in Main Hub',
+                '• Wipe Redis Queue — in Main Hub',
+                '',
+                '<b>🤖 AI Settings</b>',
+                '• Telegram AI Prompt — in Main Hub',
+                '• General AI API — in Main Hub',
+                '• AI Vibe / Gender — in Main Hub',
+                '',
+                '<b>🔐 Access Control</b>',
+                '• Force Join Manager — in Main Hub (DM only)',
+                '• Manage Sudo Users — in Main Hub',
+                '• Auto-Pair ON/OFF — in Main Hub',
+                '',
+                '<b>🎛️ Node Controls</b>',
+                '• Deploy Node — in Main Hub',
+                '• Purge Node — inside Node Panel',
+                '• Restart Node — inside Node Panel',
+                '• Node AI Prompt / API — inside Node Panel',
+            ].join('\n'));
+        }
+        return { pages, ...back };
+    };
+
+    const getUrlToolsPanelView = (userId, sessionKey) => {
+        const mode = getAutoUrlStateForUser(userId);
+        const isUrlOn = mode.enabled && mode.nodeKey === sessionKey;
+        const autoStickerOn = getAutoStickerStateForUser(userId);
+        const urlStatus = isUrlOn ? '🟢 ON' : '🔴 OFF';
+        const stickerWarning = autoStickerOn
+            ? '\n\n⚠️ <b>Note:</b> Auto Sticker is ON, so normal auto media URL will not work unless you add <code>#url</code> in the caption.'
+            : '';
+
+        return {
+            text: `🔗 <b>MEDIA URL TOOLS</b>\n\nAuto URL Mode: <b>${urlStatus}</b>\n\nWhen Auto URL is ON, media can return direct links.\n\nTip: add <code>#url</code> in caption to force URL output.${stickerWarning}\n\nManual commands in WhatsApp:\n• <code>.tourl</code> - auto detect image/video/file\n• <code>.imgurl</code> - image only\n• <code>.videourl</code> - video only\n• <code>.fileurl</code> - document only`,
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text: '🟢 URL ON', callback_data: `urltools_toggle_on_${sessionKey}`, style: 'success' },
+                        { text: '🔴 URL OFF', callback_data: `urltools_toggle_off_${sessionKey}`, style: 'danger' },
+                    ],
+                    [{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}`, style: 'primary' }],
+                ],
+            }
+        };
+    };
+
+    function getNodeControlView(sessionKey, userId = '') {
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        const sock = activeSockets.get(sessionKey);
+        const isOnline = sock?.user ? 'Online 🟢' : 'Connecting/Offline ⏳';
+        const botId = sock?.user?.id?.split(':')[0] || sessionKey.split('_')[0] || '';
+        const radarOn = isRadarEnabled(botId);
+        const nodePrompt = getNodeAiPrompt(userId, sessionKey);
+        const nodeApi = getNodeAiApi(userId, sessionKey);
+        const promptState = nodePrompt ? 'Custom ✅' : 'Default';
+        const apiState = nodeApi
+            ? `${nodeApi.provider}/${nodeApi.model} (${String(nodeApi.plan || 'free').toUpperCase()})`
+            : 'Global default';
+
+        const text = `📱 <b>NODE CONTROL: +${phone}</b>\n\n<b>Status:</b> ${isOnline}\n<b>Radar:</b> ${radarOn ? 'ON 🟢' : 'OFF 🔴'}\n<b>Node AI Prompt:</b> ${promptState}\n<b>Node AI API:</b> <code>${escapeHtml(apiState)}</code>\n\n<i>Select a management protocol for this specific number:</i>`;
+
+        const reply_markup = {
+            inline_keyboard: [
+                [
+                    { text: '🔄 Restart Node', callback_data: `restart_node_${sessionKey}`, style: 'primary' },
+                    { text: '🗑️ Purge Node', callback_data: `purge_node_${sessionKey}`, style: 'danger' }
+                ],
+                [ { text: `📡 Radar ${radarOn ? 'ON' : 'OFF'}`, callback_data: `radar_toggle_${sessionKey}`, style: radarOn ? 'success' : 'danger' } ],
+                [ { text: '📡 Broadcast & Godcast', callback_data: `bcast_node_${sessionKey}`, style: 'primary' } ],
+                [ { text: '🔗 URL Tools', callback_data: `urltools_node_${sessionKey}`, style: 'primary' } ],
+                [ { text: '🧠 Node AI Prompt', callback_data: `node_ai_prompt_${sessionKey}`, style: 'primary' } ],
+                [ { text: '🌐 Node AI API / Model', callback_data: `node_ai_api_${sessionKey}`, style: 'primary' } ],
+                [ { text: '🎯 Nexus Sniper', callback_data: `nexus_node_${sessionKey}`, style: 'primary' } ],
+                [
+                    { text: '💬 Send DM', callback_data: `dm_node_${sessionKey}`, style: 'primary' },
+                    { text: '🖼️ Upload Status', callback_data: `status_node_${sessionKey}`, style: 'primary' }
+                ],
+                [ { text: '📸 Group Status (Config)', callback_data: `gstatus_node_${sessionKey}`, style: 'success' } ],
+                [ { text: '🌟 Set GC Status', callback_data: `setnewgcstatus_node_${sessionKey}`, style: 'success' } ],
+                [ { text: `🧬 AI Vibe: ${getAiVibeLabel(getAiVibeForNode(userId, sessionKey))}`, callback_data: `node_vibe_toggle_${sessionKey}`, style: 'primary' } ],
+                [ { text: '🔗 Join Intel GCs', callback_data: `intel_join_${sessionKey}`, style: 'success' } ],
+                [ { text: '📤 Send All Intel Links', callback_data: `intel_send_${sessionKey}` }, { text: '🗑️ Clear Intel DB', callback_data: `intel_clear_${sessionKey}` } ],
+                [ { text: '💬 Chat Mode (send cmds to this node)', callback_data: `chat_node_${sessionKey}`, style: 'success' } ],
+                [ { text: '🔙 Back to Nodes', callback_data: 'menu_nodes', style: 'primary' } ]
+            ]
+        };
+
+        return { text, reply_markup };
+    }
+
+    // ==========================================
+    // ⚙️ ULTIMATE PER-SESSION CONTROL PANEL
+    // ==========================================
+    // ─── CHAT MODE: lock Telegram chat to a specific node ─────────────
+    bot.action(/^chat_node_(.+)$/, (ctx) => {
+        ctx.answerCbQuery();
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        ctx.session = ctx.session || {};
+        ctx.session.activeChatNode = sessionKey;
+        ctx.editMessageText(
+            `💬 <b>CHAT MODE ACTIVE</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📱 Node: <code>+${phone}</code>\n\nAll commands you type now go directly to this node.\nExamples: <code>.menu</code>, <code>.play song</code>, <code>.img anime girl</code>\n\n<i>Type /exitchat to leave Chat Mode.</i>`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ Exit Chat Mode', callback_data: `node_${sessionKey}` }]] } }
+        ).catch(() => {});
+    });
+
+    bot.action(/^node_(\d+_\d+_\d+)$/, (ctx) => {
+        ctx.answerCbQuery();
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        const scoped = resolveTelegramNodeScope(userId, userRole, sessionKey);
+        if (!scoped) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const { text, reply_markup } = getNodeControlView(sessionKey, userId);
+        // Exit chat mode when navigating back to node panel.
+        ctx.session = ctx.session || {};
+        ctx.session.activeChatNode = null;
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action(/^radar_toggle_(.+)$/, async (ctx) => {
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const sock = activeSockets.get(sessionKey);
+        const botId = sock?.user?.id?.split(':')[0] || sessionKey.split('_')[0] || '';
+        const next = !isRadarEnabled(botId);
+        setRadarEnabled(botId, next);
+        await ctx.answerCbQuery(`Radar ${next ? 'enabled' : 'disabled'} for this node`).catch(() => {});
+        const { text, reply_markup } = getNodeControlView(sessionKey, userId);
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    // ─── INTEL GC JOIN (per node, slow & safe) ───────────────────────────────
+    bot.action(/^intel_join_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const sock = activeSockets.get(sessionKey);
+        const phone = sessionKey.split('_')[1] || sessionKey;
+
+        if (!sock?.user) {
+            return ctx.editMessageText('❌ <b>Node is offline.</b> Restart it first.', {
+                parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `node_${sessionKey}` }]] }
+            }).catch(() => {});
+        }
+
+        const intelPath = path.join(__dirname, '../data/intel.json');
+        let intel;
+        try {
+            intel = JSON.parse(await fsp.readFile(intelPath, 'utf8'));
+        } catch {
+            return ctx.editMessageText('❌ <b>Intel DB not found.</b>', {
+                parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `node_${sessionKey}` }]] }
+            }).catch(() => {});
+        }
+
+        const codes = intel.knownLinks || [];
+        if (codes.length === 0) {
+            return ctx.editMessageText('⚠️ <b>No GC links in Intel DB.</b>', {
+                parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `node_${sessionKey}` }]] }
+            }).catch(() => {});
+        }
+
+        // Fetch groups node is already in
+        let alreadyIn = new Set();
+        try {
+            const groups = await require('./groupCache').getAllGroups(sock);
+            for (const g of Object.values(groups)) alreadyIn.add(g.id);
+        } catch { /* non-fatal */ }
+
+        const statusMsg = await ctx.editMessageText(
+            `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes: <b>${codes.length}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n\n⏳ Scanning & joining slowly...`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }]] } }
+        ).catch(() => null);
+
+        const log = [];
+        const pushLog = (line) => { log.unshift(line); if (log.length > 8) log.pop(); };
+
+        const updateMsg = async (done, total, header) => {
+            if (!statusMsg) return;
+            await global.tgBot.telegram.editMessageText(
+                ctx.chat.id, statusMsg.message_id, null,
+                `🔗 <b>INTEL GC JOIN — ${header}</b>\n📱 Node: +${phone}\n📊 Progress: <b>${done}/${total}</b>\n\n<code>${log.join('\n')}</code>`,
+                { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }]] } }
+            ).catch(() => {});
+        };
+
+        // Run in background — save progress so it can resume after restart
+        const resumePath = path.join(__dirname, `../data/intel_join_${sessionKey}.json`);
+        let startIndex = 0;
+        try {
+            const saved = JSON.parse(await fsp.readFile(resumePath, 'utf8'));
+            if (saved.lastIndex) startIndex = saved.lastIndex;
+        } catch {}
+
+        (async () => {
+            let joined = 0, requested = 0, skipped = 0, failed = 0;
+
+            for (let i = startIndex; i < codes.length; i++) {
+                // Save progress every 5 joins so restart can resume
+                if (i % 5 === 0) await fsp.writeFile(resumePath, JSON.stringify({ lastIndex: i, sessionKey }), 'utf8').catch(() => {});
+
+                if (!activeSockets.has(sessionKey)) {
+                    pushLog('⚠️ Node went offline — stopping.');
+                    await updateMsg(i, codes.length, 'STOPPED');
+                    break;
+                }
+
+                const code = codes[i];
+                const shortCode = code.slice(0, 10) + '...';
+
+                try {
+                    const result = await sock.groupAcceptInvite(code);
+                    if (result && typeof result === 'string') {
+                        joined++;
+                        pushLog(`✅ Joined: ${result.split('@')[0]}`);
+                    } else {
+                        // null result = approval/request needed
+                        requested++;
+                        pushLog(`📨 Requested: ${shortCode}`);
+                    }
+                } catch (err) {
+                    const m = err.message?.toLowerCase() || '';
+                    if (m.includes('already') || m.includes('already-participant')) {
+                        skipped++;
+                        pushLog(`⏭️ Already in: ${shortCode}`);
+                    } else if (
+                        m.includes('gone') || m.includes('not-found') ||
+                        m.includes('revoked') || m.includes('404') ||
+                        m.includes('bad-request') || m.includes('bad_request') ||
+                        m.includes('invalid') || m.includes('expired') ||
+                        m.includes('rate-overlimit')
+                    ) {
+                        skipped++;
+                        pushLog(`🗑️ Dead/invalid: ${shortCode}`);
+                    } else if (m.includes('403') || m.includes('forbidden')) {
+                        skipped++;
+                        pushLog(`🚫 Restricted: ${shortCode}`);
+                    } else if (m.includes('rate') || m.includes('429') || m.includes('too many')) {
+                        // Rate limited — pause 60s then continue
+                        pushLog(`⏳ Rate limit hit — pausing 60s...`);
+                        await updateMsg(i + 1, codes.length, 'RATE LIMITED — PAUSING');
+                        await new Promise(res => setTimeout(res, 60000));
+                        failed++;
+                    } else {
+                        failed++;
+                        pushLog(`❌ Failed: ${shortCode} — ${err.message.slice(0, 25)}`);
+                        logger.warn(`[Intel Join] ${code}: ${err.message}`);
+                    }
+                }
+
+                // Live update every 5 codes
+                if ((i + 1) % 5 === 0) await updateMsg(i + 1, codes.length, 'IN PROGRESS');
+
+                // 20–40s random delay between joins
+                if (i < codes.length - 1) {
+                    await new Promise(res => setTimeout(res, 20000 + Math.random() * 20000));
+                }
+            }
+
+            // Final summary — clear resume file
+            await fsp.unlink(resumePath).catch(() => {});
+            if (statusMsg) {
+                await global.tgBot.telegram.editMessageText(
+                    ctx.chat.id, statusMsg.message_id, null,
+                    `✅ <b>INTEL GC JOIN COMPLETE</b>\n📱 Node: +${phone}\n\n✅ Joined: <b>${joined}</b>\n📨 Requested (approval needed): <b>${requested}</b>\n⏭️ Skipped (dead/already in): <b>${skipped}</b>\n❌ Failed: <b>${failed}</b>`,
+                    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }]] } }
+                ).catch(() => {});
+            }
+        })();
+    });
+
+    // ─── INTEL SEND ALL LINKS ───────────────────────────────────────────────
+    bot.action(/^intel_send_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const intelPath = path.join(__dirname, '../data/intel.json');
+        let intel;
+        try { intel = JSON.parse(await fsp.readFile(intelPath, 'utf8')); } catch {
+            return ctx.editMessageText('❌ Intel DB not found.', { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `node_${sessionKey}` }]] } }).catch(() => {});
+        }
+        const codes = intel.knownLinks || [];
+        if (codes.length === 0) return ctx.editMessageText('⚠️ No links in Intel DB.', { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `node_${sessionKey}` }]] } }).catch(() => {});
+
+        // Split into chunks of 50 links per message
+        const chunkSize = 50;
+        const links = codes.map(c => `https://chat.whatsapp.com/${c}`);
+        for (let i = 0; i < links.length; i += chunkSize) {
+            const chunk = links.slice(i, i + chunkSize).join('\n');
+            await ctx.reply(`🔗 <b>Intel Links ${i + 1}–${Math.min(i + chunkSize, links.length)} of ${links.length}:</b>\n\n${chunk}`, { parse_mode: 'HTML' }).catch(() => {});
+        }
+        ctx.reply(`✅ Sent all <b>${links.length}</b> intel links.`, { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    // ─── INTEL CLEAR DB ────────────────────────────────────────────────────
+    bot.action(/^intel_clear_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        ctx.editMessageText('⚠️ <b>Are you sure?</b>\nThis will delete ALL intel links permanently.', {
+            parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+                [{ text: '✅ Yes, wipe it', callback_data: `intel_clear_confirm_${sessionKey}` }, { text: '❌ Cancel', callback_data: `node_${sessionKey}` }]
+            ]}
+        }).catch(() => {});
+    });
+
+    bot.action(/^intel_clear_confirm_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const intelPath = path.join(__dirname, '../data/intel.json');
+        const empty = { knownLinks: [], pendingQueue: [], dailyJoins: 0, lastJoinDate: new Date().toISOString().split('T')[0], autoJoinEnabled: false, lastJoinTimestamp: 0 };
+        await fsp.writeFile(intelPath, JSON.stringify(empty, null, 2), 'utf8').catch(() => {});
+        ctx.editMessageText('✅ <b>Intel DB wiped.</b> All links deleted.', {
+            parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }]] }
+        }).catch(() => {});
+    });
+
+    // ─── PER-SESSION ACTIONS ──────────────────────────────────────────────────
+    bot.action(/^restart_node_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery();
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const parts = sessionKey.split('_');
+        
+        const sock = activeSockets.get(sessionKey);
+        if (sock) {
+            try { sock.ws.close(); } catch(e) { logger.warn('ws.close failed', { error: e.message }); }
+            activeSockets.delete(sessionKey);
+        }
+        
+        ctx.editMessageText(`🔄 <b>RESTARTING NODE +${parts[1]}...</b>\nAllow up to 10 seconds for the node to reconnect to WhatsApp.`, {
+            parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Nodes', callback_data: 'menu_nodes', style: 'primary' }]] }
+        }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+
+        setTimeout(() => { startWhatsApp(parts[0], parts[1], parts[2] || '1', true).catch(e => logger.error(e)); }, 3000);
+    });
+
+    bot.action(/^purge_node_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery();
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const parts      = sessionKey.split('_');
+        const phoneNumber = parts[1];
+        const sock = activeSockets.get(sessionKey);
+
+        if (sock) {
+            try { sock.logout(); } catch(e) { sock.ws.close(); }
+            activeSockets.delete(sessionKey);
+        }
+
+        const sessionDir = path.join(SESSIONS_PATH, path.basename(sessionKey));
+        try { await fsp.rm(sessionDir, { recursive: true, force: true }); } catch (e) { logger.warn('Failed to rm session dir', { error: e.message }); }
+
+        // Clean up DB, ownerManager and pairingRegistry
+        try {
+            const ownerMgr   = require('../modules/ownerManager');
+            const pairingReg = require('../modules/pairingRegistry');
+            const User       = require('../core/models/User');
+            const purgedJid  = `${phoneNumber}@s.whatsapp.net`;
+            const linkedTelegramUserId = pairingReg.getUserIdByPhone(phoneNumber);
+
+            // Remove Telegram dynamic role bindings linked to the purged node owner.
+            if (linkedTelegramUserId) {
+                await rbac.removeDynamicRole(String(ownerTelegramId), String(linkedTelegramUserId)).catch(() => {});
+            }
+
+            await ownerMgr.removeSudo(purgedJid).catch(() => {});
+            await ownerMgr.removeOwner(purgedJid).catch(() => {});
+            await pairingReg.unregisterByPhone(phoneNumber).catch(() => {});
+            await User.deleteOne({ userId: purgedJid }).catch(() => {});
+        } catch {}
+
+        ctx.editMessageText(`🗑️ <b>NODE PURGED</b>\nSession + DB records permanently destroyed.`, {
+            parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Nodes', callback_data: 'menu_nodes', style: 'primary' }]] }
+        }).catch((e) => logger.warn('editMessageText failed', { error: e.message }));
+    });
+
+    bot.action(/^bcast_node_(.+)$/, (ctx) => {
+        ctx.answerCbQuery();
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, ctx.match[1])) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const text = `📡 <b>BROADCAST TOOLS</b>\n\nYou can use the Universal Bridge to control this node by typing commands directly in Telegram:\n\n• <b>Godcast:</b> <code>.godcast Your Message</code>\n• <b>Standard Gcast:</b> <code>.gcast Your Message</code>\n• <b>Schedule:</b> <code>.schedulecast 15m Message</code>`;
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${ctx.match[1]}` }]] } }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action(/^urltools_node_(.+)$/, (ctx) => {
+        ctx.answerCbQuery();
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const { text, reply_markup } = getUrlToolsPanelView(userId, sessionKey);
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action(/^urltools_toggle_(on|off)_(.+)$/, (ctx) => {
+        const action = ctx.match[1];
+        const sessionKey = ctx.match[2];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const turnOn = action === 'on';
+        const nextState = turnOn
+            ? { enabled: true, nodeKey: sessionKey }
+            : { enabled: false, nodeKey: null };
+        setAutoUrlStateForUser(ctx.from?.id, nextState);
+
+        ctx.answerCbQuery(turnOn ? 'Auto URL enabled' : 'Auto URL disabled').catch(() => {});
+
+        const { text, reply_markup } = getUrlToolsPanelView(userId, sessionKey);
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action(/^node_ai_prompt_(?!reset_)(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!canManageNodeAi(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Only the node owner can change this node AI prompt.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const current = getNodeAiPrompt(userId, sessionKey) || '(using default Omega prompt)';
+        const preview = current.length > 300 ? current.slice(0, 300) + '...' : current;
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingNodeAiPromptSessionKey = sessionKey;
+        return ctx.editMessageText(
+            `🧠 <b>NODE AI PROMPT</b>\n\nNode: <code>${escapeHtml(sessionKey)}</code>\nCurrent:\n<code>${escapeHtml(preview)}</code>\n\nSend the new prompt now.`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [
+                    [{ text: '🔄 Reset Node Prompt', callback_data: `node_ai_prompt_reset_${sessionKey}` }],
+                    [{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }],
+                ] },
+            }
+        ).catch(() => {});
+    });
+
+    bot.action(/^node_ai_prompt_reset_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!canManageNodeAi(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Only the node owner can reset this prompt.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        clearNodeAiPrompt(userId, sessionKey);
+        const { text, reply_markup } = getNodeControlView(sessionKey, userId);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action(/^node_ai_api_(?!set_|back$)(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!activeSockets.has(sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        if (!canManageNodeAi(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Only the node owner can change this node AI API.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        ctx.session = ctx.session || {};
+        ctx.session.nodeApiSessionKey = sessionKey;
+        const nodeCfg = getNodeAiApi(userId, sessionKey) || getGlobalAiSettings();
+        const provider = nodeCfg.provider || 'alibaba';
+        const plan = nodeCfg.plan || 'free';
+        const keyState = nodeCfg.apiKey ? 'Custom key ✅' : 'Server key';
+        const text = `🌐 <b>NODE AI API</b>\n\nNode: <code>${escapeHtml(sessionKey)}</code>\nCurrent API: <code>${escapeHtml(provider)}</code>\nModel: <code>${escapeHtml(nodeCfg.model || '')}</code>\nPlan: <b>${plan.toUpperCase()}</b>\nKey: <b>${keyState}</b>\n\nChoose API provider:`;
+        const inline_keyboard = [
+            ...buildProviderButtons('node_ai_api_set_provider_', provider),
+            [{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}`, style: 'primary' }],
+        ];
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard } }).catch(() => {});
+    });
+
+    bot.action(/^node_ai_api_set_provider_(alibaba|openrouter|openai|nvidia|awsbedrock|claude|deepseek|digitalocean)$/, (ctx) => {
+        const provider = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const sessionKey = ctx.session?.nodeApiSessionKey;
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!sessionKey) return ctx.answerCbQuery().catch(() => {});
+        if (!canManageNodeAi(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Only the node owner can change this node AI API.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        ctx.session = ctx.session || {};
+        ctx.session.nodeApiSessionKey = sessionKey;
+        ctx.session.nodeApiProvider = provider;
+        const inline_keyboard = [
+            [{ text: '🔑 Use Custom API Key', callback_data: 'node_ai_api_set_key_custom', style: 'success' }],
+            [{ text: '🧩 Use Server API Key', callback_data: 'node_ai_api_set_key_default', style: 'primary' }],
+            [{ text: '🔙 Back to API Providers', callback_data: 'node_ai_api_back', style: 'primary' }],
+        ];
+        return ctx.editMessageText(`🌐 <b>NODE AI API</b>\nProvider: <b>${escapeHtml(getProviderLabel(provider))}</b>\n\nNow choose key mode.`, {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard },
+        }).catch(() => {});
+    });
+
+    bot.action('node_ai_api_set_key_custom', (ctx) => {
+        const provider = ctx.session?.nodeApiProvider;
+        const sessionKey = ctx.session?.nodeApiSessionKey;
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!provider) return ctx.answerCbQuery().catch(() => {});
+        if (!sessionKey || !canManageNodeAi(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Only the node owner can change this node AI API.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        ctx.session.awaitingNodeApiKey = true;
+        return ctx.editMessageText(
+            `🔑 <b>NODE API KEY INPUT</b>\nProvider: <b>${escapeHtml(getProviderLabel(provider))}</b>\n\nSend your API key in the next message.`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'node_ai_api_back', style: 'danger' }]] },
+            }
+        ).catch(() => {});
+    });
+
+    bot.action('node_ai_api_set_key_default', (ctx) => {
+        const provider = ctx.session?.nodeApiProvider;
+        const sessionKey = ctx.session?.nodeApiSessionKey;
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!provider) return ctx.answerCbQuery().catch(() => {});
+        if (!sessionKey || !canManageNodeAi(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Only the node owner can change this node AI API.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        ctx.session.nodeApiKeyDraft = '';
+        const inline_keyboard = [[
+            { text: '🆓 Free', callback_data: 'node_ai_api_set_plan_free', style: 'success' },
+            { text: '💎 Paid', callback_data: 'node_ai_api_set_plan_paid', style: 'danger' },
+        ], [{ text: '🔙 Back', callback_data: 'node_ai_api_back', style: 'primary' }]];
+        return ctx.editMessageText('Plan check: is this API usage Free or Paid?', { parse_mode: 'HTML', reply_markup: { inline_keyboard } }).catch(() => {});
+    });
+
+    bot.action(/^node_ai_api_set_plan_(free|paid)$/, (ctx) => {
+        const plan = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const sessionKey = ctx.session?.nodeApiSessionKey;
+        const provider = ctx.session?.nodeApiProvider;
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!sessionKey || !provider) return ctx.answerCbQuery().catch(() => {});
+        if (!canManageNodeAi(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Only the node owner can change this node AI API.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const apiKey = String(ctx.session?.nodeApiKeyDraft || '');
+        const model = getPlanModel(provider, plan);
+        updateNodeAiApi(userId, sessionKey, { provider, plan, model, apiKey });
+        ctx.session.nodeApiKeyDraft = '';
+        if (provider === 'openrouter') {
+            const models = getProviderCatalog().openrouter || [];
+            const inline_keyboard = [
+                [{ text: '🎲 Auto Rotate Models', callback_data: 'node_ai_api_set_model_auto', style: 'success' }],
+                ...models.map((m, idx) => ([{ text: m, callback_data: `node_ai_api_set_model_${idx}`, style: 'primary' }])),
+                [{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}`, style: 'primary' }],
+            ];
+            return ctx.editMessageText(`✅ Plan saved as <b>${plan.toUpperCase()}</b>.\nOpenRouter default model: <code>${escapeHtml(model)}</code>\n\nYou can optionally choose another model:`, {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard },
+            }).catch(() => {});
+        }
+        ctx.answerCbQuery(`Saved ${provider}/${model}`).catch(() => {});
+        const { text, reply_markup } = getNodeControlView(sessionKey, userId);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action('node_ai_api_back', (ctx) => {
+        const sessionKey = ctx.session?.nodeApiSessionKey;
+        if (!sessionKey) return ctx.answerCbQuery().catch(() => {});
+        ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        const nodeCfg = getNodeAiApi(userId, sessionKey) || getGlobalAiSettings();
+        const provider = nodeCfg.provider || 'alibaba';
+        const text = `🌐 <b>NODE AI API</b>\n\nNode: <code>${escapeHtml(sessionKey)}</code>\nCurrent: <code>${escapeHtml(provider)} / ${escapeHtml(nodeCfg.model || '')}</code>\n\nChoose provider:`;
+        const inline_keyboard = [
+            ...buildProviderButtons('node_ai_api_set_provider_', provider),
+            [{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}`, style: 'primary' }],
+        ];
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard } }).catch(() => {});
+    });
+
+    bot.action('node_ai_api_set_model_auto', (ctx) => {
+        const userId = String(ctx.from?.id || '');
+        const sessionKey = ctx.session?.nodeApiSessionKey;
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!sessionKey) return ctx.answerCbQuery().catch(() => {});
+        if (!canManageNodeAi(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Only the node owner can change this node AI API.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        updateNodeAiApi(userId, sessionKey, { model: 'auto' });
+        ctx.answerCbQuery().catch(() => {});
+        const { text, reply_markup } = getNodeControlView(sessionKey, userId);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action(/^node_ai_api_set_model_(\d+)$/, (ctx) => {
+        const idx = Number(ctx.match[1]);
+        const userId = String(ctx.from?.id || '');
+        const sessionKey = ctx.session?.nodeApiSessionKey;
+        const provider = ctx.session?.nodeApiProvider;
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!sessionKey || !provider) {
+            return ctx.answerCbQuery().catch(() => {});
+        }
+        if (!canManageNodeAi(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Only the node owner can change this node AI API.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const models = getProviderCatalog()[provider] || [];
+        const model = models[idx] || models[0];
+        if (!model) return ctx.answerCbQuery().catch(() => {});
+        updateNodeAiApi(userId, sessionKey, { provider, model });
+        ctx.answerCbQuery(`Set ${provider}/${model}`).catch(() => {});
+        const { text, reply_markup } = getNodeControlView(sessionKey, userId);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action('cmd_global_ai_api', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const cfg = getGlobalAiSettings();
+        const inline_keyboard = [
+            ...buildProviderButtons('global_ai_api_set_provider_', cfg.provider),
+            [{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }],
+        ];
+        return ctx.editMessageText(
+            `🌐 <b>GLOBAL AI API (OWNER)</b>\n\nCurrent: <code>${escapeHtml(cfg.provider)} / ${escapeHtml(cfg.model)}</code>\nPlan: <b>${escapeHtml(String(cfg.plan || 'free').toUpperCase())}</b>\nKey: <b>${cfg.apiKey ? 'Custom key ✅' : 'Server key'}</b>\n\nChoose provider:`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard } }
+        ).catch(() => {});
+    });
+
+    bot.action(/^global_ai_api_set_provider_(alibaba|openrouter|openai|nvidia|awsbedrock|claude|deepseek|digitalocean)$/, (ctx) => {
+        const provider = ctx.match[1];
+        ctx.session = ctx.session || {};
+        ctx.session.globalApiProvider = provider;
+        const inline_keyboard = [
+            [{ text: '🔑 Use Custom API Key', callback_data: 'global_ai_api_set_key_custom', style: 'success' }],
+            [{ text: '🧩 Use Server API Key', callback_data: 'global_ai_api_set_key_default', style: 'primary' }],
+            [{ text: '🔙 Back to Provider List', callback_data: 'cmd_global_ai_api', style: 'primary' }],
+        ];
+        return ctx.editMessageText(`🌐 <b>GLOBAL AI API</b>\nProvider: <b>${escapeHtml(getProviderLabel(provider))}</b>\n\nNow choose key mode.`, {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard },
+        }).catch(() => {});
+    });
+
+    bot.action('global_ai_api_set_key_custom', (ctx) => {
+        const provider = ctx.session?.globalApiProvider;
+        if (!provider) return ctx.answerCbQuery().catch(() => {});
+        ctx.session.awaitingGlobalApiKey = true;
+        return ctx.editMessageText(
+            `🔑 <b>GLOBAL API KEY INPUT</b>\nProvider: <b>${escapeHtml(getProviderLabel(provider))}</b>\n\nSend your API key in the next message.`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'cmd_global_ai_api', style: 'danger' }]] } }
+        ).catch(() => {});
+    });
+
+    bot.action('global_ai_api_set_key_default', (ctx) => {
+        const provider = ctx.session?.globalApiProvider;
+        if (!provider) return ctx.answerCbQuery().catch(() => {});
+        ctx.session.globalApiKeyDraft = '';
+        const inline_keyboard = [[
+            { text: '🆓 Free', callback_data: 'global_ai_api_set_plan_free', style: 'success' },
+            { text: '💎 Paid', callback_data: 'global_ai_api_set_plan_paid', style: 'danger' },
+        ], [{ text: '🔙 Back', callback_data: 'cmd_global_ai_api', style: 'primary' }]];
+        return ctx.editMessageText('Plan check: is this API usage Free or Paid?', { parse_mode: 'HTML', reply_markup: { inline_keyboard } }).catch(() => {});
+    });
+
+    bot.action(/^global_ai_api_set_plan_(free|paid)$/, (ctx) => {
+        const plan = ctx.match[1];
+        const provider = ctx.session?.globalApiProvider;
+        if (!provider) return ctx.answerCbQuery().catch(() => {});
+        const apiKey = String(ctx.session?.globalApiKeyDraft || '');
+        const model = getPlanModel(provider, plan);
+        updateGlobalAiSettings({ provider, plan, model, apiKey });
+        ctx.session.globalApiKeyDraft = '';
+        if (provider === 'openrouter') {
+            const models = getProviderCatalog().openrouter || [];
+            const inline_keyboard = [
+                [{ text: '🎲 Auto Rotate Models', callback_data: 'global_ai_api_set_model_auto', style: 'success' }],
+                ...models.map((m, idx) => ([{ text: m, callback_data: `global_ai_api_set_model_${idx}`, style: 'primary' }])),
+                [{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }],
+            ];
+            return ctx.editMessageText(`✅ Plan saved as <b>${plan.toUpperCase()}</b>.\nOpenRouter default model: <code>${escapeHtml(model)}</code>\n\nOptional: choose a fixed model:`, {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard },
+            }).catch(() => {});
+        }
+        ctx.answerCbQuery(`Saved ${provider}/${model}`).catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        const { text, reply_markup } = getMainDashboardMenu(userId);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action('global_ai_api_set_model_auto', (ctx) => {
+        updateGlobalAiSettings({ model: 'auto' });
+        ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        const { text, reply_markup } = getMainDashboardMenu(userId);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action(/^global_ai_api_set_model_(\d+)$/, (ctx) => {
+        const idx = Number(ctx.match[1]);
+        const provider = ctx.session?.globalApiProvider;
+        if (!provider) return ctx.answerCbQuery().catch(() => {});
+        const models = getProviderCatalog()[provider] || [];
+        const model = models[idx] || models[0];
+        if (!model) return ctx.answerCbQuery().catch(() => {});
+        updateGlobalAiSettings({ provider, model });
+        ctx.answerCbQuery(`Set ${provider}/${model}`).catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        const { text, reply_markup } = getMainDashboardMenu(userId);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action('cmd_ai_vibe', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const vibe = getGlobalAiSettings().vibe;
+        return ctx.editMessageText(`🧬 <b>GLOBAL AI VIBE / GENDER</b>\n\nCurrent: <b>${getAiVibeLabel(vibe)}</b>\n\nOnly owner can change this general Telegram AI vibe.`, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text: vibe === 'girl' ? '✅ Girl 💖' : 'Girl 💖', callback_data: 'global_ai_vibe_set_girl', style: vibe === 'girl' ? 'success' : 'primary' },
+                        { text: vibe === 'guy' ? '✅ Guy 😎' : 'Guy 😎', callback_data: 'global_ai_vibe_set_guy', style: vibe === 'guy' ? 'success' : 'primary' },
+                    ],
+                    [{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }],
+                ],
+            },
+        }).catch(() => {});
+    });
+
+    bot.action(/^global_ai_vibe_set_(girl|guy)$/, (ctx) => {
+        const vibe = ctx.match[1] === 'girl' ? 'girl' : 'guy';
+        setGlobalAiVibe(vibe);
+        ctx.answerCbQuery(`Global vibe set: ${getAiVibeLabel(vibe)}`).catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        const { text, reply_markup } = getMainDashboardMenu(userId);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action(/^autosticker_toggle_(on|off)(?:_(.+))?$/, (ctx) => {
+        const action = ctx.match[1];
+        const sessionKey = ctx.match[2] || null;
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+
+        const turnOn = action === 'on';
+
+        setAutoStickerStateForUser(userId, turnOn);
+        ctx.answerCbQuery(turnOn ? 'Auto Sticker ON 🟢' : 'Auto Sticker OFF 🔴').catch(() => {});
+
+        if (sessionKey) {
+            if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+                return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+            }
+            const { text, reply_markup } = getUrlToolsPanelView(userId, sessionKey);
+            return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+        }
+        // If toggled from the path view, refresh path view in-place
+        const { text: pathText, reply_markup: pathMarkup } = getCommandPathView(userId);
+        return ctx.editMessageText(pathText, { parse_mode: 'HTML', reply_markup: pathMarkup })
+            .catch(() => ctx.reply(`✅ <b>Auto Sticker ${turnOn ? 'enabled 🟢' : 'disabled 🔴'}</b>`, { parse_mode: 'HTML' }));
+    });
+
+    bot.action('cmd_sticker_panel', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        const { text, reply_markup } = getStickerPanelView(userId);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    bot.action('cmd_tg_ai_prompt', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const current = getTgCustomPrompt() || '(using built-in Telegram AI prompt)';
+        const preview = current.length > 300 ? current.slice(0, 300) + '...' : current;
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingTgPrompt = true;
+        return ctx.editMessageText(
+            `🤖 <b>TELEGRAM AI PROMPT EDITOR</b>\n\n<b>Current:</b>\n<code>${escapeHtml(preview)}</code>\n\n<i>Send your new Telegram AI prompt as a message now.\nThis is separate from the WhatsApp AI prompt.</i>`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+                [{ text: '🔄 Reset to Default', callback_data: 'cmd_tg_ai_prompt_reset', style: 'danger' }],
+                [{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }]
+            ]}}
+        ).catch(() => {});
+    });
+
+    bot.action('cmd_tg_ai_prompt_reset', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        try { await fsp.unlink(TG_PROMPT_FILE_LOCAL); } catch { /* already gone */ }
+        return ctx.editMessageText('✅ <b>Telegram AI prompt reset to built-in default.</b>', {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }]] }
+        }).catch(() => {});
+    });
+
+    bot.action('cmd_guide', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const guideText = `📖 <b>PAPPY ULTIMATE — USER GUIDE</b>
+
+<b>📱 Getting Started</b>
+• <b>/start</b> — Open main navigation
+• <b>/pair</b> — Link your WhatsApp number
+• <b>/nodes</b> — View & manage your active nodes
+• <b>/exitchat</b> — Leave node chat mode
+
+<b>🤖 WhatsApp AI (Pappy Mode)</b>
+• <code>.pappy on</code> — Enable AI in a group
+• <code>.pappy off</code> — Disable AI in a group
+• Mention the bot or reply to it to trigger AI
+• Send a sticker → bot replies with an AI sticker
+• Send a voice note → bot replies with voice
+• Send an image → bot analyzes and replies
+
+<b>🎵 Music & Video</b>
+• <code>.play [song]</code> — Download & send audio
+• <code>.video [search]</code> — Download & send video
+• <b>Music Finder</b> (Telegram) — Send a song name, pick from results
+• Add <b>video</b> in your query to get video instead of audio
+
+<b>🎨 Stickers</b>
+• <code>.sticker</code> — Reply to image/video to convert
+• <b>Auto Sticker</b> (Telegram) — Toggle in Sticker Panel
+• <b>My Pack</b> — Add AI stickers to your Telegram pack
+• <code>/autosticker on|off</code> — Toggle auto sticker
+
+<b>📡 Broadcast</b>
+• <code>.gcast [msg]</code> — Broadcast to all groups
+• <code>.godcast [msg]</code> — Premium broadcast
+• <code>.schedulecast [time] [msg]</code> — Schedule a broadcast
+
+<b>🛡️ Group Management</b>
+• <code>.tag [msg]</code> — Tag all members
+• <code>.promote</code> / <code>.demote</code> — Admin control
+• <code>.kick</code> / <code>.ban</code> / <code>.warn</code> — Moderation
+• <code>.mute</code> / <code>.unmute</code> — Lock/unlock chat
+• <code>.antilink on/off</code> — Block links from non-admins
+• <code>.antidemote on/off</code> — Prevent bot demotion
+
+<b>🔗 Media & URLs</b>
+• <code>.tourl</code> — Reply to media to get direct URL
+• <code>.img [desc]</code> — Generate AI image
+• <code>.tts [text]</code> — Text-to-speech voice note
+• <b>Auto Downloader</b> (Telegram) — Send TikTok/YT/IG link to download
+
+<b>🧠 AI Configuration</b>
+• <b>Node AI Prompt</b> — Custom personality per node
+• <b>Node AI API</b> — Set provider, model, key per node
+• <b>AI Vibe</b> — Switch between Guy 😎 / Girl 💖 personality
+• Providers: DigitalOcean, OpenRouter, OpenAI, Alibaba, NVIDIA, DeepSeek, Claude
+
+<b>🔑 Roles</b>
+<code>public</code> — Anyone in the group
+<code>admin</code> — Group admin
+<code>sudo</code> — Trusted operator
+<code>owner</code> — Full access
+
+<b>⚙️ Owner Only</b>
+• Sleep / Wake engine
+• Restart system
+• Force Join Manager (DM only)
+• Support Inbox
+• Global AI API & Vibe settings
+• Menu Song Studio`;
+        return ctx.reply(guideText, {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Path', callback_data: 'menu_path', style: 'primary' }]] }
+        }).catch(() => {});
+    });
+
+    bot.action('cmd_plain_list', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        const { pages, reply_markup } = getPlainListView(userId);
+        for (let i = 0; i < pages.length; i++) {
+            const opts = i === pages.length - 1 ? { parse_mode: 'HTML', reply_markup } : { parse_mode: 'HTML' };
+            await ctx.reply(pages[i], opts).catch(() => {});
+        }
+    });
+
+    bot.action(/^nexus_node_(.+)$/, (ctx) => {
+        ctx.answerCbQuery();
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, ctx.match[1])) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const text = `🎯 <b>NEXUS SNIPER PROTOCOL</b>\n\nTo silently infiltrate a group and DM its members, type:\n\n<code>.nexus [group_jid] [Your message]</code>\n\n<i>Tip: Use {group} in your text to magically insert the group's name so it looks human.</i>`;
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${ctx.match[1]}` }]] } }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action(/^dm_node_(.+)$/, (ctx) => {
+        ctx.answerCbQuery();
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, ctx.match[1])) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const text = `💬 <b>DIRECT MESSAGE</b>\n\nTo send a DM via this node, type:\n\n<code>/dm [phone_number] [message]</code>`;
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${ctx.match[1]}` }]] } }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action(/^status_node_(.+)$/, (ctx) => {
+        ctx.answerCbQuery();
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, ctx.match[1])) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const text = `🖼️ <b>UPLOAD STATUS / MEDIA</b>\n\n• <b>Text Status:</b> <code>/status [message]</code>\n• <b>Media Status:</b> Send a Photo/Video to this Telegram bot with the caption <code>/castmedia</code>.`;
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${ctx.match[1]}` }]] } }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    // ==========================================
+    // 📸 GROUP STATUS SUBMENU (Dynamic Menu Engine)
+    // ==========================================
+    function buildGsMenu(sessionKey) {
+        const gs  = gsPlugin;
+        const cfg = gs ? gs.getGsConfig(sessionKey) : { backgroundColor: '#000000', font: 0, repeat: 1 };
+        const BG_COLORS = gs?.BG_COLORS || {};
+        const FONTS     = gs?.FONTS || {};
+        const colorName = cfg.backgroundColor === 'auto' ? 'auto (rotate)' : (Object.keys(BG_COLORS).find(k => BG_COLORS[k] === cfg.backgroundColor) || cfg.backgroundColor);
+        const fontName  = Object.keys(FONTS).find(k => FONTS[k] === cfg.font) || String(cfg.font);
+        const text = `📸 <b>GROUP STATUS ENGINE</b>\n\n🎨 Background : <code>${colorName}</code>\n🖊️ Font : <code>${fontName}</code>\n🔁 Repeat : <code>${cfg.repeat}×</code>\n\n<i>Post a story to all groups this node is in.</i>`;
+        const reply_markup = {
+            inline_keyboard: [
+                [ { text: '🎨 Change Color', callback_data: `gs_color_${sessionKey}`, style: 'primary' }, { text: '🖊️ Change Font', callback_data: `gs_font_${sessionKey}`, style: 'primary' } ],
+                [ { text: '🔁 Set Repeat', callback_data: `gs_repeat_${sessionKey}`, style: 'primary' }, { text: '🗑️ Reset Config', callback_data: `gs_reset_${sessionKey}`, style: 'danger' } ],
+                [ { text: '📤 Post Now', callback_data: `gs_postnow_${sessionKey}`, style: 'success' } ],
+                [ { text: '🔙 Back to Node', callback_data: `node_${sessionKey}` } ]
+            ]
+        };
+        return { text, reply_markup };
+    }
+
+    bot.action(/^gstatus_node_(.+)$/, (ctx) => {
+        ctx.answerCbQuery();
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, ctx.match[1])) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const { text, reply_markup } = buildGsMenu(ctx.match[1]);
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action(/^gs_color_(?!set_)(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const BG_COLORS = gsPlugin?.BG_COLORS || { blue: '#1A73E8' };
+        // Show colors in rows of 3
+        const colorKeys = ['auto', ...Object.keys(BG_COLORS)];
+        const buttons = [];
+        for (let i = 0; i < colorKeys.length; i += 3) {
+            buttons.push(colorKeys.slice(i, i + 3).map(name => ({
+                text: name === 'auto' ? '🎲 auto (rotate)' : `🎨 ${name}`,
+                callback_data: `gs_color_set_${sessionKey}_${name}`,
+                style: 'primary'
+            })));
+        }
+        buttons.push([{ text: '🔙 Back', callback_data: `gstatus_node_${sessionKey}` }]);
+        return ctx.editMessageText('🎨 <b>Choose status background color</b>\n\n<i>auto = different color per group/post</i>', {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: buttons }
+        }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action(/^gs_color_set_(.+?)_(auto|black|white|blue|red|purple|pink|green|teal|orange|yellow|navy|rose|indigo|lime|cyan|gold|maroon|forest|slate|violet|coral|mint|wine|sky|peach)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const colorName = ctx.match[2];
+        const newColor = colorName === 'auto' ? 'auto' : gsPlugin?.BG_COLORS?.[colorName];
+        if (newColor) {
+            gsPlugin.setGsConfig(sessionKey, { backgroundColor: newColor });
+        }
+        const { text, reply_markup } = buildGsMenu(sessionKey);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch((e) => logger.warn('editMessageText failed', { error: e.message }));
+    });
+
+    bot.action(/^gs_font_(?!set_)(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const FONTS = gsPlugin?.FONTS || { sans: 0 };
+        const buttons = Object.keys(FONTS).map((name) => ([
+            { text: `🖊️ ${name}`, callback_data: `gs_font_set_${sessionKey}_${name}`, style: 'primary' }
+        ]));
+        buttons.push([{ text: '🔙 Back', callback_data: `gstatus_node_${sessionKey}` }]);
+        return ctx.editMessageText('🖊️ <b>Choose status font</b>', {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: buttons }
+        }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action(/^gs_font_set_(.+)_(sans|serif|mono|bold)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const fontName = ctx.match[2];
+        if (gsPlugin?.FONTS?.[fontName] !== undefined) {
+            gsPlugin.setGsConfig(sessionKey, { font: gsPlugin.FONTS[fontName] });
+        }
+        const { text, reply_markup } = buildGsMenu(sessionKey);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch((e) => logger.warn('editMessageText failed', { error: e.message }));
+    });
+
+    bot.action(/^gs_repeat_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingGsRepeatNode = sessionKey;
+        return ctx.editMessageText(
+            '🔁 <b>Set repeat count</b>\n\nSend a number from <code>1</code> to <code>20</code>.',
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `gstatus_node_${sessionKey}` }]] } }
+        ).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    // ─── SET GC STATUS PER NODE ───────────────────────────────────────────────
+    bot.action(/^setnewgcstatus_node_(.+)$/, (ctx) => {
+        ctx.answerCbQuery();
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        ctx.session = ctx.session || {};
+        ctx.session.gcStatusNode = sessionKey;
+        ctx.editMessageText(
+            `🌟 <b>GC STATUS SNIPER</b>\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `📱 Node: <code>+${phone}</code>\n\n` +
+            `Drop your content below 👇\n` +
+            `• Plain text or a link\n` +
+            `• Links get auto link-preview injected\n\n` +
+            `<i>Waiting for your message...</i>`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🗑️ Remove Current GC Status', callback_data: `setnewgcstatus_remove_node_${sessionKey}`, style: 'danger' }],
+                        [{ text: '❌ Cancel', callback_data: `node_${sessionKey}` }]
+                    ]
+                }
+            }
+        ).catch(() => {});
+    });
+
+    bot.action(/^setnewgcstatus_remove_node_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+
+        if (!rbac.hasRolePermission(userRole, 'SUDO')) {
+            return ctx.reply('⚠️ Access denied. SUDO role is required to remove GC Entry Drop.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        const result = await clearWarmupPayloadForPhone(phone);
+
+        if (ctx.session) {
+            if (ctx.session.gcStatusNode === sessionKey) ctx.session.gcStatusNode = null;
+            if (ctx.session.warmupNode === sessionKey) ctx.session.warmupNode = null;
+            if (ctx.session.state === 'AWAITING_WARMUP_CONTENT') ctx.session.state = 'IDLE';
+        }
+
+        const response = result.removed > 0
+            ? `🗑️ <b>GC Entry Drop removed.</b>\n\n📱 Node: <code>+${phone}</code>\nRemoved files: <b>${result.removed}</b>`
+            : `ℹ️ <b>No saved GC Entry Drop found.</b>\n\n📱 Node: <code>+${phone}</code>`;
+
+        return ctx.editMessageText(response, {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }]] }
+        }).catch(() => {});
+    });
+
+    bot.action(/^gs_reset_(.+)$/, (ctx) => {
+        ctx.answerCbQuery();
+        const sessionKey = ctx.match[1];
+        if (gsPlugin) gsPlugin.setGsConfig(sessionKey, { backgroundColor: gsPlugin.BG_COLORS.green, font: gsPlugin.FONTS.sans, repeat: 1 });
+        const { text, reply_markup } = buildGsMenu(sessionKey);
+        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch((e) => logger.warn('editMessageText failed', { error: e.message }));
+    });
+
+    bot.action(/^gs_postnow_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingGsPostNode = sessionKey;
+        ctx.editMessageText(
+            `📤 <b>POST GROUP STATUS</b>\n\nDrop the text/link in your next message.\nThis will post to all groups for the selected node with Ghost Protocol.\n\n<i>Send /cancel to abort.</i>`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `gstatus_node_${sessionKey}` }]] } }
+        ).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    // ─── PER-NODE VIBE TOGGLE ─────────────────────────────────────────────────
+    bot.action(/^node_vibe_toggle_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const current = getAiVibeForNode(userId, sessionKey);
+        const next = current === 'girl' ? 'guy' : 'girl';
+        setAiVibeForNode(userId, sessionKey, next);
+        ctx.answerCbQuery(`Node vibe set: ${getAiVibeLabel(next)}`).catch(() => {});
+        const { text, reply_markup } = getNodeControlView(sessionKey, userId);
+        return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+    });
+
+    // 🔗 GC LINK EXTRACTOR
+    bot.action('cmd_gclink_help', (ctx) => {
+        ctx.answerCbQuery();
+        const helpText = `🔗 <b>GC LINK EXTRACTOR</b>
+
+Extract WhatsApp group invite links by JID in Telegram.
+
+<b>Usage:</b>
+/gclink 120xxxxxxxxxxxx@g.us
+
+<b>Example:</b>
+/gclink 120223344556677@g.us
+
+Returns the group's public invite link if available.`;
+        ctx.editMessageText(helpText, { 
+            parse_mode: 'HTML', 
+            reply_markup: { 
+                inline_keyboard: [[{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }]] 
+            } 
+        }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    // ==========================================
+    // [MIGRATED] 🧠 AI PROMPT EDITOR → commands/ai/ai.command.js
+    // [MIGRATED] 👑 SUDO MANAGEMENT → commands/admin/sudo.command.js
+    // [MIGRATED] 🛠️ SYSTEM CONTROLS → commands/system/control.command.js
+    // ==========================================
+
+    // 🔗 RESTORED NATIVE TELEGRAM COMMANDS
+    // ==========================================
+    // [MIGRATED] /ai → commands/ai/ai.command.js
+    // [MIGRATED] /pair, /rmsession → commands/whatsapp/pair.command.js
+    // [MIGRATED] /gcast, /godcast, /castmedia, /dm, /status → commands/messaging/broadcast.command.js
+    // [MIGRATED] /osint → commands/intel/osint.command.js
+    // [MIGRATED] /wipequeue → commands/system/control.command.js
+    // ==========================================
+
+
+    // [MIGRATED] /pair → commands/whatsapp/pair.command.js
+
+    // [MIGRATED] /updategstatus → kept below as bridge-level command (uses rbac/gsPlugin directly)
+    bot.command('updategstatus', async (ctx) => {
+        const text = ctx.message.text.replace('/updategstatus', '').trim();
+        if (!text) return ctx.reply('❌ Usage: <code>/updategstatus Your text</code>', { parse_mode: 'HTML' });
+
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        const scoped = resolveTelegramNodeScope(userId, userRole);
+        const sock = scoped?.sock || null;
+        if (!sock) return ctx.reply('❌ No active WhatsApp nodes.');
+
+        const gs = gsPlugin;
+        if (!gs) return ctx.reply('❌ Group Status plugin not loaded.');
+
+        ctx.reply('📡 <b>Posting group status...</b>', { parse_mode: 'HTML' });
+
+        const mockMsg = {
+            key: { remoteJid: sock.user.id.split(':')[0] + '@s.whatsapp.net', fromMe: true, id: `TG_GS_${Date.now()}` },
+            message: { conversation: `.updategstatus ${text}` }
+        };
+        const roleMap = { OWNER: 'owner', SUDO: 'owner', ADMIN: 'admin', USER: 'public' };
+        const currentRole = ctx.state?.userRole || rbac.getUserRole(String(ctx.from?.id || ''));
+        const mockUser = { role: roleMap[currentRole] || 'public', stats: { commandsUsed: 0 }, activity: { isBanned: false } };
+        
+        const bridgeSock = new Proxy(sock, {
+            get(target, prop) {
+                if (prop === 'sendMessage') {
+                    return async (jid, payload, ...rest) => {
+                        if (payload.text) ctx.reply(`📱 <b>STATUS:</b>\n${payload.text}`, { parse_mode: 'HTML' });
+                        else return target.sendMessage(jid, payload, ...rest);
+                    };
+                }
+                return target[prop];
+            }
+        });
+
+        // 🧠 SaaS Fix: Aligned with the Router destructuring
+        taskManager.submit(makeTelegramTaskId('TG_GS', userId, scoped?.sessionKey), async (abortSignal) => {
+            await gs.execute({ sock: bridgeSock, msg: mockMsg, args: text.split(' '), text: `.updategstatus ${text}`, user: mockUser, botId: sock.user.id.split(':')[0], abortSignal });
+        }, { priority: 5, timeout: 120000 }).catch(err => ctx.reply(`❌ ${err.message}`));
+    });
+
+    bot.command('gclink', async (ctx) => {
+        const input = String(ctx.message.text || '').replace('/gclink', '').trim();
+        if (!input) {
+            return ctx.reply('❌ Usage: <code>/gclink 120xxxxxxxxxxxx@g.us</code>', { parse_mode: 'HTML' });
+        }
+
+        const groupJid = input.split(/\s+/)[0];
+        if (!/@g\.us$/i.test(groupJid)) {
+            return ctx.reply('❌ Invalid group JID. Example: <code>1203634...@g.us</code>', { parse_mode: 'HTML' });
+        }
+
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        const scoped = resolveTelegramNodeScope(userId, userRole);
+        const sock = scoped?.sock || null;
+        if (!sock?.user) return ctx.reply('❌ No active WhatsApp node available.');
+
+        await ctx.reply('🔎 Extracting group invite link...').catch(() => {});
+        try {
+            const code = await sock.groupInviteCode(groupJid);
+            return ctx.reply(`✅ <b>Invite Link</b>\n<code>https://chat.whatsapp.com/${code}</code>`, { parse_mode: 'HTML' });
+        } catch (e) {
+            return ctx.reply(`❌ Could not extract invite link for that JID.\nReason: <code>${String(e.message || e)}</code>`, { parse_mode: 'HTML' });
+        }
+    });
+
+    // ==========================================
+    // 🌉 UNIVERSAL TELEGRAM-TO-WHATSAPP BRIDGE
+    // ==========================================
+    bot.on('text', async (ctx, next) => {
+        // Skip forum topic system messages (direct_messages_topic) — they have no real text
+        if (ctx.message?.is_topic_message && !ctx.message?.text) return next();
+        const text = ctx.message?.text || '';
+        if (!text) return next();
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+
+        // Track group members passively
+        if (isTelegramGroupChat(ctx) && ctx.from && !ctx.from.is_bot) {
+            const chatId = String(ctx.chat.id);
+            if (!tgGroupMembersState.has(chatId)) tgGroupMembersState.set(chatId, new Map());
+            tgGroupMembersState.get(chatId).set(userId, {
+                first_name: ctx.from.first_name || '',
+                username: ctx.from.username || '',
+                last_seen: Date.now()
+            });
+            // Debounced save
+            if (!tgGroupMembersState._savePending) {
+                tgGroupMembersState._savePending = true;
+                setTimeout(async () => {
+                    tgGroupMembersState._savePending = false;
+                    try {
+                        const obj = {};
+                        for (const [cid, members] of tgGroupMembersState) {
+                            if (typeof cid !== 'string') continue;
+                            obj[cid] = {};
+                            for (const [uid, info] of members) obj[cid][uid] = info;
+                        }
+                        await fsp.writeFile(TG_GROUP_MEMBERS_FILE, JSON.stringify(obj), 'utf8');
+                    } catch {}
+                }, 5000);
+            }
+        }
+
+        if (ctx.session?.awaitingForceJoinAdd || ctx.session?.awaitingForceJoinEditId) {
+            if (!rbac.hasRolePermission(userRole, 'OWNER')) {
+                ctx.session.awaitingForceJoinAdd = false;
+                ctx.session.awaitingForceJoinEditId = null;
+                return ctx.reply('⚠️ Access denied. Owner only.', { parse_mode: 'HTML' }).catch(() => {});
+            }
+
+            const parsed = parseForceJoinInput(text, ctx.message?.forward_from_chat || null);
+            if (!parsed) {
+                return ctx.reply('❌ Invalid format. Send a forwarded message from target chat, or one of:\n<code>@username</code>\n<code>https://t.me/username</code>\n<code>-1001234567890|https://t.me/+invite|My Group</code>', { parse_mode: 'HTML' }).catch(() => {});
+            }
+
+            try {
+                const chat = await bot.telegram.getChat(parsed.chatId);
+                const title = String(parsed.title || chat?.title || chat?.username || parsed.chatId);
+                const cfg = loadForceJoinConfig();
+                const editId = String(ctx.session.awaitingForceJoinEditId || '');
+                if (editId) {
+                    cfg.links = (cfg.links || []).map((l) => l.id === editId ? { ...l, chatId: parsed.chatId, title, url: parsed.url || l.url || '' } : l);
+                    ctx.session.awaitingForceJoinEditId = null;
+                } else {
+                    const link = {
+                        id: `fj_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                        chatId: parsed.chatId,
+                        title,
+                        url: parsed.url || '',
+                        createdAt: Date.now(),
+                    };
+                    cfg.links = Array.isArray(cfg.links) ? cfg.links : [];
+                    cfg.links.push(link);
+                    ctx.session.awaitingForceJoinAdd = false;
+                }
+                saveForceJoinConfig(cfg);
+                const view = getForceJoinManagerView();
+                return ctx.reply('✅ Force-join link saved.', { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+            } catch (err) {
+                return ctx.reply(`❌ Cannot access that chat as bot. Add bot there first, then retry.\n<code>${escapeHtml(err.message || String(err))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+            }
+        }
+
+        if (String(text || '').trim().toLowerCase() === '/cancel' && (ctx.session?.awaitingMenuSongUploadMode || ctx.session?.awaitingMenuSongRenameId)) {
+            ctx.session.awaitingMenuSongUploadMode = null;
+            ctx.session.awaitingMenuSongRenameId = null;
+            const { text: panelText, reply_markup } = getMenuSongStudioView();
+            return ctx.reply(`❌ Menu song action canceled.\n\n${panelText}`, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+        }
+
+        const tgAiEnabled = isTgAiEnabledForUser(userId);
+        const looksLikeCommand = text.startsWith('/') || text.startsWith('.');
+        const chatType = String(ctx.chat?.type || '');
+        const isGroupChat = chatType === 'group' || chatType === 'supergroup';
+        // Check if user is in any active session state — AI must not intercept these
+        const hasActiveSession = !!(
+            ctx.session?.awaitingSupportReplyEntryId ||
+            ctx.session?.awaitingSupportBroadcastEntryId ||
+            ctx.session?.supportCompose ||
+            ctx.session?.awaitingPrompt ||
+            ctx.session?.awaitingNodeAiPromptSessionKey ||
+            ctx.session?.awaitingNodeApiKey ||
+            ctx.session?.awaitingGlobalApiKey ||
+            ctx.session?.awaitingGsPostNode ||
+            ctx.session?.awaitingGsRepeatNode ||
+            ctx.session?.awaitingWarmupConfig ||
+            ctx.session?.awaitingGroupStatus ||
+            ctx.session?.awaitingTgPrompt ||
+            ctx.session?.awaitingMenuSongUploadMode ||
+            ctx.session?.awaitingMenuSongRenameId ||
+            ctx.session?.awaitingForceJoinAdd ||
+            ctx.session?.awaitingForceJoinEditId ||
+            ctx.session?.awaitingWelcomeMedia
+        );
+
+        // ── GROUP PROTECTION ENFORCEMENT ─────────────────────────────────────
+        if (isGroupChat && !hasActiveSession) {
+            const cfg = getGroupProtectConfig(String(ctx.chat.id));
+            const senderIsAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(userId));
+            if (!senderIsAdmin) {
+                const txt = String(text || '');
+                const hasLink = /https?:\/\/|t\.me\//i.test(txt);
+                const isForward = !!ctx.message?.forward_date;
+
+                if (cfg.antiForward?.enabled && isForward) {
+                    await applyGroupProtectionAction(ctx, cfg, cfg.antiForward.action, 'forwarded message');
+                    return next();
+                }
+
+                if (cfg.antiLink?.enabled && hasLink) {
+                    await applyGroupProtectionAction(ctx, cfg, cfg.antiLink.action, 'link posting');
+                    return next();
+                }
+
+                if (cfg.antiSpam?.enabled) {
+                    const key = `${ctx.chat.id}:${userId}`;
+                    const now = Date.now();
+                    const windowMs = Math.max(3, Number(cfg.antiSpam.windowSec || 12)) * 1000;
+                    const limit = Math.max(2, Number(cfg.antiSpam.limit || 6));
+                    const prev = tgSpamTracker.get(key) || { hits: [] };
+                    const hits = Array.isArray(prev.hits) ? prev.hits.filter((t) => now - Number(t) <= windowMs) : [];
+                    hits.push(now);
+                    tgSpamTracker.set(key, { hits });
+                    if (hits.length >= limit) {
+                        await applyGroupProtectionAction(ctx, cfg, cfg.antiSpam.action, 'spam flood');
+                        tgSpamTracker.set(key, { hits: [] });
+                        return next();
+                    }
+                }
+            }
+        }
+
+        // ── AUTO-DOWNLOADER: detect social media URLs ────────────────────────
+        if (!hasActiveSession && !looksLikeCommand && isAutoDlEnabled(userId)) {
+            const urlMatch = text.match(AUTO_DL_URL_RE);
+            if (urlMatch) {
+                const detectedUrl = urlMatch[0];
+                const platform = detectPlatformFromUrl(detectedUrl);
+                const statusMsg = await ctx.reply(
+                    `${platform.emoji} <b>${platform.name} link detected</b>\n\n🔍 <i>Fetching info...</i>`,
+                    { parse_mode: 'HTML' }
+                ).catch(() => null);
+                try {
+                    await downloadUrlAndSend(ctx, detectedUrl, statusMsg);
+                    await editStatus(ctx, statusMsg, `${platform.emoji} <b>${platform.name}</b> — ✅ Done!`);
+                    setTimeout(() => {
+                        if (statusMsg?.message_id) ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+                    }, 4000);
+                } catch (err) {
+                    logger.warn('[AutoDL] Download failed', { url: detectedUrl, error: err.message });
+                    await editStatus(ctx, statusMsg,
+                        `${platform.emoji} <b>${platform.name}</b> — ❌ Failed\n<code>${escapeHtml(err.message || String(err))}</code>`
+                    );
+                }
+                return next();
+            }
+        }
+
+        // ── MUSIC FINDER: search by song name text ────────────────────────────
+        if (!hasActiveSession && isMusicDlEnabled(userId) && !AUTO_DL_URL_RE.test(text)) {
+            const trimmed = text.trim();
+            const groupPlayMatch = trimmed.match(/^(?:\/play|\.play)\s+(.+)/i);
+            const groupPappyPlayMatch = trimmed.match(/^pappy\s+play\s+(.+)/i);
+            const queryFromGroupTrigger = groupPlayMatch?.[1] || groupPappyPlayMatch?.[1] || '';
+
+            // In groups, force explicit trigger only (/play or "pappy play ...") to avoid spam.
+            const shouldHandleMusic = isGroupChat
+                ? !!queryFromGroupTrigger
+                : (!looksLikeCommand && trimmed.length >= 2 && trimmed.length <= 120 && !/[.!?]{2,}/.test(trimmed));
+
+            if (shouldHandleMusic) {
+                const finalQuery = (isGroupChat ? queryFromGroupTrigger : trimmed).trim();
+                const statusMsg = await ctx.reply(`🎵 <b>Searching for:</b> <i>${escapeHtml(finalQuery)}</i>\n\n🔍 <i>Looking up top matches...</i>`, { parse_mode: 'HTML' }).catch(() => null);
+                try {
+                    const { results, hasMore } = await searchSongs(finalQuery, 0);
+                    if (!results.length) {
+                        await editStatus(ctx, statusMsg, `❌ No results found for <b>${escapeHtml(finalQuery)}</b>`);
+                        return next();
+                    }
+                    const searchToken = rememberMusicSearch(userId, finalQuery);
+                    await editStatus(ctx, statusMsg, `🎵 <b>Pick a song:</b>`);
+                    const inline_keyboard = results.map((r, i) => [{
+                        text: `${i + 1}. ${r.title.slice(0, 38)} — ${r.uploader.slice(0, 18)} [${r.duration}]`,
+                        callback_data: `musicpick:${/\bvideo\b/i.test(finalQuery) ? 'v:' : ''}${r.videoId}`
+                    }]);
+                    if (hasMore) {
+                        inline_keyboard.push([{ text: '➡️ Next', callback_data: `musicmore:${searchToken}:1` }]);
+                    }
+                    await ctx.reply(
+                        `${/\bvideo\b/i.test(finalQuery) ? '🎬' : '🎵'} <b>Results for:</b> <i>${escapeHtml(finalQuery)}</i>\n\nTap the one you want:`,
+                        { parse_mode: 'HTML', reply_markup: { inline_keyboard } }
+                    ).catch((err) => {
+                        logger.warn('[MusicDL] Failed to send result keyboard', { error: err?.message || String(err) });
+                    });
+                    if (statusMsg?.message_id) ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+                } catch (err) {
+                    logger.warn('[MusicDL] Search failed', { query: finalQuery, error: err.message });
+                    await editStatus(ctx, statusMsg, `❌ Search failed: <code>${escapeHtml(err.message)}</code>`);
+                }
+                return next();
+            }
+        }
+
+        // AI only replies when directly triggered: mention (@bot) or reply to bot's own message
+        const tgBotId = ctx.botInfo?.id;
+        const botUsername = ctx.botInfo?.username || '';
+        const isMentioned = botUsername && text.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
+        const isReplyToBot = !!(ctx.message?.reply_to_message?.from?.id && tgBotId &&
+            String(ctx.message.reply_to_message.from.id) === String(tgBotId));
+        const isWakePhrase = /\bpappy\b/i.test(String(text || '').trim());
+        // Group AI: mention/reply/wake phrase. DM AI: mention/reply/wake phrase.
+        const aiTriggered = isMentioned || isReplyToBot || isWakePhrase;
+        // pappy keyword always triggers AI — even if Telegram AI toggle is off
+        const shouldAiReply = !looksLikeCommand && !hasActiveSession && ai && aiTriggered && (tgAiEnabled || isWakePhrase);
+        if (shouldAiReply) {
+            // ── Per-user AI queue — replies one by one like a human ──────────
+            if (!global._tgAiQueues) global._tgAiQueues = new Map();
+            if (!global._tgAiQueues.has(userId)) {
+                const fastq = require('fastq');
+                global._tgAiQueues.set(userId, fastq.promise(async (task) => {
+                    try { await task(); } catch {}
+                }, 1)); // concurrency 1 — one reply at a time per user
+            }
+            global._tgAiQueues.get(userId).push(async () => {
+            const cleanTextBase = isMentioned
+                ? text.replace(new RegExp(`@${botUsername}`, 'gi'), '').trim()
+                : text;
+            const cleanText = cleanTextBase.replace(/^pappy\s*/i, '').trim() || cleanTextBase;
+            const nodeScope = resolveTelegramNodeScope(userId, userRole, ctx.session?.activeChatNode || undefined);
+            const aiVibe = getGlobalAiSettings().vibe || 'guy';
+            const vibeExtra = aiVibe === 'girl'
+                ? 'Global Telegram AI vibe: GIRL. Keep replies feminine, soft, and playful when appropriate.'
+                : 'Global Telegram AI vibe: GUY. Keep replies masculine, confident, and chill when appropriate.';
+            const nodePrompt = nodeScope?.sessionKey ? getNodeAiPrompt(userId, nodeScope.sessionKey) : '';
+            const nodeApiCfg = nodeScope?.sessionKey ? getNodeAiApi(userId, nodeScope.sessionKey) : null;
+            const globalApiCfg = getGlobalAiSettings();
+            const provider = nodeApiCfg?.provider || globalApiCfg.provider || 'alibaba';
+            const model = nodeApiCfg?.model || globalApiCfg.model || 'qwen-plus';
+            const apiKey = nodeApiCfg?.apiKey || globalApiCfg.apiKey || '';
+            const nodePromptExtra = nodePrompt ? `Node owner custom AI prompt: ${nodePrompt}` : '';
+            const actionHints = 'If moderation is needed in a Telegram group, you may return DELETE_MESSAGE. If the user asks for a poll, return CREATE_POLL:Question|Option 1|Option 2 (2-10 options).';
+
+            // User identity context — AI knows who they are and what they can do
+            const userName = ctx.from?.first_name || ctx.from?.username || 'User';
+            const isOwner = String(userId) === String(ownerTelegramId);
+            const roleLabel = isOwner ? 'OWNER' : String(userRole || 'USER').toUpperCase();
+            const userContext = `You are talking to ${userName} (Telegram ID: ${userId}). Their role is ${roleLabel}.`;
+            const rolePermissions = roleLabel === 'OWNER'
+                ? `${userName} is the OWNER — full access to everything: terminal, broadcast, node management, all commands, system restart, wipe queues, manage sudo users.`
+                : roleLabel === 'SUDO'
+                ? `${userName} is SUDO — can broadcast (.gcast, .godcast), manage group status, node management. Cannot access terminal or system commands.`
+                : roleLabel === 'ADMIN'
+                ? `${userName} is ADMIN — can manage nodes, URL tools, group moderation. Cannot broadcast to all groups or access terminal.`
+                : `${userName} is a USER — can use music, stickers, AI chat, support. Cannot run commands or manage nodes.`;
+
+            const extraContext = [vibeExtra, nodePromptExtra, actionHints, userContext, rolePermissions].filter(Boolean).join(' | ');
+            try {
+                // Show typing indicator while AI processes
+                await ctx.sendChatAction('typing').catch(() => {});
+
+                const aiReply = await ai.generateText(cleanText || text, userId, {
+                    platform: 'telegram',
+                    role: userRole,
+                    provider,
+                    model,
+                    apiKey,
+                    extra: extraContext,
+                });
+                if (!aiReply) return;
+
+                const replyOpts = { reply_parameters: { message_id: ctx.message.message_id } };
+
+                // ── SPEAK: send voice note ────────────────────────────────────
+                if (aiReply.startsWith('SPEAK:')) {
+                    const speakText = aiReply.slice(6).trim();
+                    try {
+                        await ctx.sendChatAction('record_voice').catch(() => {});
+                        const audioBuffer = await ai.textToSpeech(speakText);
+                        await ctx.replyWithVoice({ source: audioBuffer }, replyOpts).catch(async () => {
+                            await ctx.reply(speakText, replyOpts).catch(() => {});
+                        });
+                    } catch {
+                        await ctx.reply(speakText, replyOpts).catch(() => {});
+                    }
+                    return;
+                }
+
+                // ── GENERATE_IMAGE ────────────────────────────────────────────
+                if (aiReply.startsWith('GENERATE_IMAGE:')) {
+                    const imgPrompt = aiReply.slice(15).trim();
+                    await ctx.sendChatAction('upload_photo').catch(() => {});
+                    try {
+                        const imgBuf = await ai.generateImage(imgPrompt);
+                        await ctx.replyWithPhoto({ source: imgBuf }, { caption: imgPrompt.slice(0, 200), ...replyOpts }).catch(() => {});
+                    } catch {
+                        await ctx.reply("couldn't generate that image rn", replyOpts).catch(() => {});
+                    }
+                    return;
+                }
+
+                // ── SEND_STICKER / STICKER: AI sticker response ──────────────
+                if (aiReply.startsWith('SEND_STICKER:') || aiReply.startsWith('STICKER:')) {
+                    const prefixLen = aiReply.startsWith('SEND_STICKER:') ? 13 : 8;
+                    const stickerPromptRaw = aiReply.slice(prefixLen).trim();
+
+                    // Check if user sent/replied to an image or video — convert it directly
+                    const hasPhoto = ctx.message?.photo?.length > 0;
+                    const hasVideo = ctx.message?.video || ctx.message?.animation;
+                    const quotedPhoto = ctx.message?.reply_to_message?.photo?.length > 0;
+                    const quotedVideo = ctx.message?.reply_to_message?.video || ctx.message?.reply_to_message?.animation;
+                    const convertIntent = /turn|convert|make|transform|this|it/i.test(stickerPromptRaw) || !stickerPromptRaw;
+
+                    if (convertIntent && (hasPhoto || hasVideo || quotedPhoto || quotedVideo)) {
+                        await ctx.sendChatAction('upload_document').catch(() => {});
+                        try {
+                            let fileId;
+                            if (hasPhoto) fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
+                            else if (hasVideo) fileId = (ctx.message.video || ctx.message.animation).file_id;
+                            else if (quotedPhoto) fileId = ctx.message.reply_to_message.photo[ctx.message.reply_to_message.photo.length - 1].file_id;
+                            else fileId = (ctx.message.reply_to_message.video || ctx.message.reply_to_message.animation).file_id;
+
+                            const fileUrl = await ctx.telegram.getFileLink(fileId);
+                            const res = await axios.get(fileUrl.href, { responseType: 'arraybuffer', timeout: 20000 });
+                            const buf = Buffer.from(res.data);
+                            const isVid = hasVideo || quotedVideo;
+                            const stickerBuf = isVid
+                                ? await createTelegramStickerFromVideo(buf)
+                                : await createTelegramStickerFromImage(buf);
+                            await ctx.replyWithSticker({ source: stickerBuf, filename: 'sticker.webm' }, replyOpts).catch(() => {});
+                        } catch (e) {
+                            await ctx.reply(`❌ couldn't convert: ${e.message}`, replyOpts).catch(() => {});
+                        }
+                        return;
+                    }
+
+                    const stickerPrompt = buildAiStickerPrompt(stickerPromptRaw, aiVibe);
+                    await ctx.sendChatAction('upload_document').catch(() => {});
+                    let sent = null;
+                    // Try up to 3 different prompts if rate limited
+                    const fallbackPrompts = [
+                        stickerPrompt,
+                        buildAiStickerPrompt(aiVibe === 'girl' ? 'cute anime girl reaction' : 'cool anime guy reaction', aiVibe),
+                        buildAiStickerPrompt(aiVibe === 'girl' ? 'kawaii anime sticker' : 'sigma anime sticker', aiVibe),
+                    ];
+                    for (const prompt of fallbackPrompts) {
+                        try {
+                            const imageBuffer = await ai.generateImage(prompt);
+                            let stickerBuffer;
+                            try { stickerBuffer = await createAnimatedStickerFromImage(imageBuffer); }
+                            catch { stickerBuffer = await createTelegramStickerFromImage(imageBuffer); }
+                            sent = await ctx.replyWithSticker({ source: stickerBuffer, filename: 'ai-sticker.webm' }, replyOpts).catch(() => null);
+                            if (sent) {
+                                const fileId = sent?.sticker?.file_id || null;
+                                if (fileId) rememberAiStickerFileId(userId, aiVibe, fileId);
+                                break;
+                            }
+                        } catch { /* try next prompt */ }
+                    }
+                    if (!sent) {
+                        // Last resort: use saved sticker silently
+                        const savedFileId = pickSavedAiStickerFileId(userId, aiVibe);
+                        if (savedFileId) await ctx.replyWithSticker(savedFileId, replyOpts).catch(() => {});
+                        else await ctx.reply("sticker gen is rate limited rn, try again in a sec", replyOpts).catch(() => {});
+                    }
+                    return;
+                }
+
+                // ── SEARCH_VIDEO ──────────────────────────────────────────────
+                if (aiReply.startsWith('SEARCH_VIDEO:')) {
+                    const query = aiReply.slice(13).trim();
+                    await ctx.sendChatAction('upload_video').catch(() => {});
+                    try {
+                        const { buffer, title } = await ai.searchVideo(query);
+                        await ctx.replyWithVideo({ source: buffer }, { caption: title, ...replyOpts }).catch(() => {});
+                    } catch {
+                        await ctx.reply("couldn't find that video", replyOpts).catch(() => {});
+                    }
+                    return;
+                }
+
+                // ── PLAY: use Telegram music feature ──────────────────────────
+                // ── PLAY_SEARCH: show search results as inline buttons ────
+                if (aiReply.startsWith('PLAY_SEARCH:')) {
+                    const query = aiReply.slice(12).trim() || '';
+                    await ctx.reply(
+                        '🎵 <b>What song do you want?</b>\n\nJust tell me the song name or artist and I\'ll find it.',
+                        { parse_mode: 'HTML', ...replyOpts }
+                    ).catch(() => {});
+                    return;
+                }
+
+                if (aiReply.startsWith('PLAY:')) {
+                    const song = aiReply.slice(5).trim();
+                    if (!song) {
+                        await ctx.reply('⚠️ Tell me what song to play.', replyOpts).catch(() => {});
+                        return;
+                    }
+
+                    const statusMsg = await ctx.reply(
+                        `🎵 <b>AI Music:</b> <i>${escapeHtml(song)}</i>\n\n🔍 <i>Searching...</i>`,
+                        { parse_mode: 'HTML', ...replyOpts }
+                    ).catch(() => null);
+
+                    try {
+                        const { results } = await searchSongs(song, 0, 1);
+                        if (!results.length) {
+                            await editStatus(ctx, statusMsg, `❌ No results found for <b>${escapeHtml(song)}</b>`);
+                            return;
+                        }
+                        const pick = results[0];
+                        await editStatus(ctx, statusMsg, `🎵 <b>${escapeHtml(pick.title || song)}</b>\n\n⏳ <i>Downloading...</i>`);
+                        await downloadAndSendSong(ctx, pick.url, statusMsg, pick.title || song);
+                        await editStatus(ctx, statusMsg, `✅ Done — <b>${escapeHtml(pick.title || song)}</b>`);
+                        setTimeout(() => {
+                            if (statusMsg?.message_id) ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+                        }, 4000);
+                    } catch (err) {
+                        await editStatus(ctx, statusMsg, `❌ Music failed: <code>${escapeHtml(err.message || String(err))}</code>`);
+                    }
+                    return;
+                }
+
+                // ── DELETE_MESSAGE: moderation helper (group admin only) ────
+                if (aiReply.startsWith('DELETE_MESSAGE')) {
+                    if (!isGroupChat) {
+                        await ctx.reply('⚠️ Message deletion is only supported in groups.', replyOpts).catch(() => {});
+                        return;
+                    }
+                    if (!rbac.hasRolePermission(userRole, 'ADMIN')) {
+                        await ctx.reply('⚠️ Delete action requires ADMIN role or above.', replyOpts).catch(() => {});
+                        return;
+                    }
+                    try {
+                        await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
+                        await ctx.reply('🧹 Message removed by AI moderation.', { parse_mode: 'HTML' }).catch(() => {});
+                    } catch (err) {
+                        await ctx.reply(`❌ Could not delete message: <code>${escapeHtml(err.message || String(err))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+                    }
+                    return;
+                }
+
+                // ── CREATE_POLL: CREATE_POLL:Question|Option 1|Option 2... ──
+                if (aiReply.startsWith('CREATE_POLL:')) {
+                    if (!isGroupChat) {
+                        await ctx.reply('⚠️ Polls can only be created in groups.', replyOpts).catch(() => {});
+                        return;
+                    }
+                    if (!rbac.hasRolePermission(userRole, 'ADMIN')) {
+                        await ctx.reply('⚠️ Poll creation requires ADMIN role or above.', replyOpts).catch(() => {});
+                        return;
+                    }
+                    const payload = aiReply.slice('CREATE_POLL:'.length).trim();
+                    const parts = payload.split('|').map((x) => String(x || '').trim()).filter(Boolean);
+                    const question = parts.shift() || '';
+                    const options = parts.slice(0, 10);
+                    if (!question || options.length < 2) {
+                        await ctx.reply('⚠️ Poll format: <code>CREATE_POLL:Question|Option 1|Option 2</code>', { parse_mode: 'HTML', ...replyOpts }).catch(() => {});
+                        return;
+                    }
+                    try {
+                        await ctx.telegram.sendPoll(ctx.chat.id, question.slice(0, 300), options.map((o) => o.slice(0, 100)), {
+                            is_anonymous: false,
+                            allows_multiple_answers: false,
+                            reply_parameters: { message_id: ctx.message.message_id },
+                        });
+                    } catch (err) {
+                        await ctx.reply(`❌ Poll failed: <code>${escapeHtml(err.message || String(err))}</code>`, { parse_mode: 'HTML', ...replyOpts }).catch(() => {});
+                    }
+                    return;
+                }
+
+                // ── EXECUTE_COMMAND: IDE-style live terminal ──────────────────
+                if (aiReply.startsWith('EXECUTE_COMMAND:')) {
+                    if (!rbac.hasRolePermission(userRole, 'ADMIN')) {
+                        await ctx.reply('⚠️ Terminal commands require ADMIN role or above.', replyOpts).catch(() => {});
+                        return;
+                    }
+                    const command = aiReply.slice(16).trim();
+                    const destructivePatterns = [
+                        /rm\s+-rf\s+\//i, /rm\s+-rf\s+~/i, /rm\s+-rf\s+\*/i,
+                        /rm.*\/home\/ubuntu/i, /rmdir.*\/home\/ubuntu/i,
+                        /rm.*omega-v5/i, /reboot/i, /shutdown/i, /poweroff/i, /halt/i,
+                        /mkfs/i, /fdisk.*w/i, /dd.*of=\/dev/i,
+                        /pm2\s+(delete|kill)\s+all/i, /pm2\s+delete\s+(omega|kord|pappy)/i,
+                    ];
+                    if (destructivePatterns.some(p => p.test(command))) {
+                        await ctx.reply('🚫 Blocked — destructive command.', replyOpts).catch(() => {});
+                        return;
+                    }
+                    logger.info(`[AI CMD] User:${userId} → ${command}`);
+                    const { spawn } = require('child_process');
+                    if (!global._aiProcs) global._aiProcs = new Map();
+                    const procKey = `${userId}_${Date.now()}`;
+                    const logMsg = await ctx.reply(
+                        `🟡 <b>Running:</b>\n<code>${escapeHtml(command)}</code>\n\n⏳ Executing…`,
+                        { parse_mode: 'HTML', ...replyOpts, reply_markup: { inline_keyboard: [[{ text: '🔴 Cancel', callback_data: `aiproc_cancel_${procKey}` }]] } }
+                    ).catch(() => null);
+                    let liveOutput = '';
+                    let lastEdit = Date.now();
+                    let done = false;
+                    let cancelled = false;
+                    const updateLive = async (final = false) => {
+                        const display = liveOutput.slice(-3000) || (final ? 'done (no output)' : '⏳ running…');
+                        const icon = cancelled ? '🔴' : final ? '🟢' : '🟡';
+                        const label = cancelled ? 'Cancelled' : final ? 'Done' : 'Live';
+                        const txt = `${icon} <b>${label}:</b> <code>${escapeHtml(command)}</code>\n\n<pre>${escapeHtml(display)}</pre>`;
+                        const markup = (final || cancelled) ? {} : { reply_markup: { inline_keyboard: [[{ text: '🔴 Cancel', callback_data: `aiproc_cancel_${procKey}` }]] } };
+                        if (logMsg) await ctx.telegram.editMessageText(ctx.chat.id, logMsg.message_id, null, txt, { parse_mode: 'HTML', ...markup }).catch(() => {});
+                    };
+                    await new Promise((resolve) => {
+                        const proc = spawn('bash', ['-c', command], { timeout: 60000 });
+                        global._aiProcs.set(procKey, { proc, cancel: () => { cancelled = true; proc.kill('SIGTERM'); } });
+                        proc.stdout.on('data', async (d) => {
+                            liveOutput += d.toString();
+                            if (Date.now() - lastEdit > 1500 && !done) { lastEdit = Date.now(); await updateLive(false); }
+                        });
+                        proc.stderr.on('data', (d) => { liveOutput += d.toString(); });
+                        proc.on('close', async () => { done = true; global._aiProcs.delete(procKey); await updateLive(true); resolve(); });
+                        proc.on('error', async (e) => { done = true; liveOutput = `Error: ${e.message}`; global._aiProcs.delete(procKey); await updateLive(true); resolve(); });
+                    });
+                    if (cancelled) return;
+                    logger.success(`[AI CMD] Done: ${command}`);
+                    if (liveOutput.trim()) {
+                        try {
+                            const outputSnippet = liveOutput.slice(-2000);
+                            const analysisPrompt = `You are an IDE AI. Analyze this terminal output briefly (1-3 lines).\nCommand: ${command}\nOutput:\n${outputSnippet}\n\nIf you see issues or have a useful follow-up command, add on a new line: SUGGEST:<bash command>|<short reason>\nIf you need to read a file: READ_FILE:<path>|<reason>\nOnly suggest if genuinely useful. Be concise.`;
+                            const analysis = await ai.generateText(analysisPrompt, userId, { platform: 'telegram', role: userRole, provider, model, apiKey });
+                            if (!analysis) return;
+                            const suggestMatch = analysis.match(/SUGGEST:([^|\n]+)\|([^\n]+)/);
+                            const readMatch    = analysis.match(/READ_FILE:([^|\n]+)\|([^\n]+)/);
+                            const cleanAnalysis = analysis.replace(/SUGGEST:[^\n]+/g,'').replace(/READ_FILE:[^\n]+/g,'').trim();
+                            const buttons = [];
+                            if (!global._aiSuggestions) global._aiSuggestions = new Map();
+                            if (suggestMatch) {
+                                const sugCmd = suggestMatch[1].trim();
+                                const sugKey = `sug_${userId}_${Date.now()}`;
+                                global._aiSuggestions.set(sugKey, { command: sugCmd, chatId: ctx.chat.id, userId });
+                                setTimeout(() => global._aiSuggestions.delete(sugKey), 300000);
+                                buttons.push([{ text: `💡 ${sugCmd.slice(0,40)}`, callback_data: 'ux:noop' }]);
+                                buttons.push([
+                                    { text: '✅ Approve', callback_data: `aisugg_approve_${sugKey}` },
+                                    { text: '❌ Reject',  callback_data: `aisugg_reject_${sugKey}`  },
+                                ]);
+                            }
+                            if (readMatch) {
+                                const filePath = readMatch[1].trim();
+                                const readKey = `read_${userId}_${Date.now()}`;
+                                global._aiSuggestions.set(readKey, { type: 'read', path: filePath, chatId: ctx.chat.id, userId });
+                                setTimeout(() => global._aiSuggestions.delete(readKey), 300000);
+                                buttons.push([{ text: `📄 Read: ${filePath.split('/').pop()}`, callback_data: 'ux:noop' }]);
+                                buttons.push([
+                                    { text: '✅ Allow',  callback_data: `aifile_allow_${readKey}`  },
+                                    { text: '🚫 Cancel', callback_data: `aifile_cancel_${readKey}` },
+                                ]);
+                            }
+                            const analysisText = cleanAnalysis ? `🧠 <b>Analysis:</b>\n${escapeHtml(cleanAnalysis)}` : '🧠 Output looks clean.';
+                            await ctx.reply(analysisText, { parse_mode: 'HTML', ...(buttons.length ? { reply_markup: { inline_keyboard: buttons } } : {}), ...replyOpts }).catch(() => {});
+                            // Save command + output + analysis to memory so AI remembers context
+                            try {
+                                const memEntry = `[Terminal] Ran: ${command}\nOutput: ${outputSnippet.slice(0,500)}\nAnalysis: ${cleanAnalysis || 'clean'}`;
+                                await ai.updateMemoryDirect(userId, `run: ${command}`, memEntry);
+                            } catch {}
+                        } catch { /* optional */ }
+                    }
+                    return;
+                }
+
+
+                // ── Plain text reply (quoting user's message) ─────────────────
+                await ctx.reply(aiReply, replyOpts).catch(() => ctx.reply(aiReply));
+                return;
+
+            } catch (e) {
+                logger.warn('Telegram AI reply failed', { error: e.message });
+                await ctx.reply('⚠️ AI is unavailable right now, try again in a moment.', {
+                    reply_parameters: { message_id: ctx.message.message_id }
+                }).catch(() => {});
+            }
+            }); // end queue task
+            return;
+            return;
+        }
+
+        // Handle owner direct reply to support user
+        if (ctx.session?.awaitingSupportReplyEntryId) {
+            const targetUserId = ctx.session.awaitingSupportReplyUserId;
+            ctx.session.awaitingSupportReplyEntryId = null;
+            ctx.session.awaitingSupportReplyUserId = null;
+            if (!targetUserId) return ctx.reply('❌ Could not determine recipient.', { parse_mode: 'HTML' }).catch(() => {});
+            try {
+                await bot.telegram.sendMessage(
+                    targetUserId,
+                    `📩 <b>Reply from Support</b>\n\n${escapeHtml(text)}`,
+                    { parse_mode: 'HTML' }
+                );
+                return ctx.reply('✅ Reply sent successfully.', {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '📥 Back to Inbox', callback_data: 'support_inbox', style: 'primary' }]] }
+                }).catch(() => {});
+            } catch (e) {
+                return ctx.reply(`❌ Failed to send reply: ${escapeHtml(e.message)}`, { parse_mode: 'HTML' }).catch(() => {});
+            }
+        }
+
+        // Handle awaiting prompt input
+        if (ctx.session?.awaitingPrompt) {
+            if (!rbac.hasRolePermission(userRole, 'OWNER')) {
+                return ctx.reply('⚠️ Access denied. Only OWNER can update the AI prompt.', { parse_mode: 'HTML' });
+            }
+            ctx.session.awaitingPrompt = false;
+            if (text.length < 10) return ctx.reply('Prompt too short, try again.');
+            await saveCustomPrompt(text);
+            return ctx.reply('✅ <b>AI prompt updated!</b>\nThe bot will use your new prompt from now on.', {
+                parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }]] }
+            });
+        }
+
+        // Handle awaiting Telegram AI prompt input
+        if (ctx.session?.awaitingTgPrompt) {
+            if (!rbac.hasRolePermission(userRole, 'OWNER')) {
+                ctx.session.awaitingTgPrompt = false;
+                return ctx.reply('⚠️ Access denied.', { parse_mode: 'HTML' });
+            }
+            ctx.session.awaitingTgPrompt = false;
+            if (text.length < 10) return ctx.reply('Prompt too short, try again.');
+            await saveTgCustomPrompt(text);
+            return ctx.reply('✅ <b>Telegram AI prompt updated!</b>\nPappy will use this prompt for Telegram replies now.', {
+                parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Hub', callback_data: 'menu_main', style: 'primary' }]] }
+            });
+        }
+
+        if (ctx.session?.awaitingMenuSongRenameId) {
+            if (!rbac.hasRolePermission(userRole, 'OWNER')) {
+                ctx.session.awaitingMenuSongRenameId = null;
+                return ctx.reply('⚠️ Access denied. Owner only.', { parse_mode: 'HTML' });
+            }
+            const songId = String(ctx.session.awaitingMenuSongRenameId || '');
+            ctx.session.awaitingMenuSongRenameId = null;
+            const renamed = menuSongManager.renameSong(songId, text);
+            const { text: panelText, reply_markup } = getMenuSongStudioView();
+            if (!renamed) {
+                return ctx.reply(`❌ Rename failed. Name cannot be empty.\n\n${panelText}`, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+            }
+            return ctx.reply(`✅ Renamed to: <b>${escapeHtml(renamed.name)}</b>\n\n${panelText}`, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+        }
+
+        if (ctx.session?.awaitingNodeAiPromptSessionKey) {
+            const sessionKey = ctx.session.awaitingNodeAiPromptSessionKey;
+            ctx.session.awaitingNodeAiPromptSessionKey = null;
+            if (!canManageNodeAi(userId, userRole, sessionKey)) {
+                return ctx.reply('⚠️ Only the node owner can update this node prompt.', { parse_mode: 'HTML' });
+            }
+            if (text.length < 10) return ctx.reply('Prompt too short, try again.');
+            setNodeAiPrompt(userId, sessionKey, text);
+            return ctx.reply('✅ <b>Node AI prompt updated!</b>\nThis node now uses your custom Omega AI behavior.', {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }]] },
+            });
+        }
+
+        if (ctx.session?.awaitingNodeApiKey) {
+            const sessionKey = ctx.session?.nodeApiSessionKey;
+            const provider = ctx.session?.nodeApiProvider;
+            ctx.session.awaitingNodeApiKey = false;
+            if (!sessionKey || !provider) return ctx.reply('⚠️ API setup session expired.', { parse_mode: 'HTML' });
+            if (!canManageNodeAi(userId, userRole, sessionKey)) {
+                return ctx.reply('⚠️ Only the node owner can update this API key.', { parse_mode: 'HTML' });
+            }
+            ctx.session.nodeApiKeyDraft = String(text || '').trim();
+            const guess = detectApiPlanFromKey(ctx.session.nodeApiKeyDraft);
+            const inline_keyboard = [[
+                { text: guess === 'free' ? '✅ Free' : '🆓 Free', callback_data: 'node_ai_api_set_plan_free', style: 'success' },
+                { text: guess === 'paid' ? '✅ Paid' : '💎 Paid', callback_data: 'node_ai_api_set_plan_paid', style: 'danger' },
+            ], [{ text: '🔙 Back', callback_data: 'node_ai_api_back', style: 'primary' }]];
+            return ctx.reply('Is this API key Free or Paid?', { parse_mode: 'HTML', reply_markup: { inline_keyboard } });
+        }
+
+        if (ctx.session?.awaitingGlobalApiKey) {
+            const provider = ctx.session?.globalApiProvider;
+            ctx.session.awaitingGlobalApiKey = false;
+            if (!rbac.hasRolePermission(userRole, 'OWNER')) {
+                return ctx.reply('⚠️ Access denied. Owner only.', { parse_mode: 'HTML' });
+            }
+            if (!provider) return ctx.reply('⚠️ API setup session expired.', { parse_mode: 'HTML' });
+            ctx.session.globalApiKeyDraft = String(text || '').trim();
+            const guess = detectApiPlanFromKey(ctx.session.globalApiKeyDraft);
+            const inline_keyboard = [[
+                { text: guess === 'free' ? '✅ Free' : '🆓 Free', callback_data: 'global_ai_api_set_plan_free', style: 'success' },
+                { text: guess === 'paid' ? '✅ Paid' : '💎 Paid', callback_data: 'global_ai_api_set_plan_paid', style: 'danger' },
+            ], [{ text: '🔙 Back', callback_data: 'cmd_global_ai_api', style: 'primary' }]];
+            return ctx.reply('Is this API key Free or Paid?', { parse_mode: 'HTML', reply_markup: { inline_keyboard } });
+        }
+
+        if (ctx.session?.supportCompose) {
+            ctx.session.supportDraft = {
+                text,
+                caption: '',
+                mediaType: 'text',
+                fileId: null,
+                fileName: null,
+                mimeType: null,
+            };
+            ctx.session.supportCompose = false;
+            const view = getSupportDraftView(ctx.session.supportDraft);
+            return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+        }
+
+        if (ctx.session?.awaitingSupportBroadcastEntryId) {
+            ctx.session.supportBroadcastDraft = text;
+            return ctx.reply(
+                `📢 <b>QUICK NEWS DRAFT</b>\n\n<code>${escapeHtml(text).slice(0, 1000)}</code>`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: '✅ Send', callback_data: 'support_broadcast_send', style: 'success' },
+                                { text: '✏️ Edit', callback_data: 'support_broadcast_edit', style: 'primary' },
+                            ],
+                            [{ text: '🗑 Delete', callback_data: 'support_broadcast_delete', style: 'danger' }]
+                        ]
+                    }
+                }
+            ).catch(() => {});
+        }
+
+        if (ctx.session?.awaitingGsPostNode) {
+            if (!rbac.hasRolePermission(userRole, 'SUDO')) {
+                ctx.session.awaitingGsPostNode = null;
+                return ctx.reply('⚠️ Access denied. SUDO role is required to post group status.', { parse_mode: 'HTML' });
+            }
+
+            if (text.trim().toLowerCase() === '/cancel') {
+                const sessionKey = ctx.session.awaitingGsPostNode;
+                ctx.session.awaitingGsPostNode = null;
+                return ctx.reply('❌ Group status post cancelled.', {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Group Status', callback_data: `gstatus_node_${sessionKey}` }]] }
+                });
+            }
+
+            const sessionKey = ctx.session.awaitingGsPostNode;
+            ctx.session.awaitingGsPostNode = null;
+            const sock = activeSockets.get(sessionKey);
+            if (!sock?.user) {
+                return ctx.reply('❌ Selected node is offline. Restart it and try again.', {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }]] }
+                });
+            }
+
+            if (!gsPlugin) return ctx.reply('❌ Group Status plugin not loaded.');
+
+            const botId = sock.user.id.split(':')[0];
+            const mockMsg = {
+                key: { remoteJid: `${botId}@s.whatsapp.net`, fromMe: true, id: `TG_GS_NODE_${Date.now()}` },
+                message: { conversation: `.ggstatus 1 ${text}` }
+            };
+            const roleMap = { OWNER: 'owner', SUDO: 'owner', ADMIN: 'admin', USER: 'public' };
+            const mockUser = { role: roleMap[userRole] || 'public', stats: { commandsUsed: 0 }, activity: { isBanned: false } };
+
+            await ctx.reply('📡 Posting group status with Ghost Protocol...').catch(() => {});
+
+            const bridgeSock = new Proxy(sock, {
+                get(target, prop) {
+                    if (prop === 'sendMessage') {
+                        return async (jid, payload, ...rest) => {
+                            if (payload?.text) {
+                                return ctx.reply(`📱 <b>STATUS:</b>\n${payload.text}`, { parse_mode: 'HTML' }).catch(() => {});
+                            }
+                            return target.sendMessage(jid, payload, ...rest);
+                        };
+                    }
+                    return target[prop];
+                }
+            });
+
+            taskManager.submit(makeTelegramTaskId('TG_GS_NODE', userId, sessionKey), async (abortSignal) => {
+                await gsPlugin.execute({
+                    sock: bridgeSock,
+                    msg: mockMsg,
+                    args: ['1', ...text.split(' ')],
+                    text: `.ggstatus 1 ${text}`,
+                    user: mockUser,
+                    botId,
+                    abortSignal
+                });
+            }, { priority: 5, timeout: 180000 }).catch(err => ctx.reply(`❌ ${err.message}`));
+
+            return;
+        }
+
+        if (ctx.session?.awaitingGsRepeatNode) {
+            const sessionKey = ctx.session.awaitingGsRepeatNode;
+            ctx.session.awaitingGsRepeatNode = null;
+            const parsed = parseInt(String(text || '').trim(), 10);
+            if (!Number.isFinite(parsed) || parsed < 1 || parsed > 20) {
+                return ctx.reply('❌ Invalid repeat value. Send a number between 1 and 20.', {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `gstatus_node_${sessionKey}` }]] }
+                }).catch(() => {});
+            }
+
+            if (gsPlugin) gsPlugin.setGsConfig(sessionKey, { repeat: parsed });
+            const { text: menuText, reply_markup } = buildGsMenu(sessionKey);
+            return ctx.reply(`✅ Repeat set to <b>${parsed}x</b>.`, {
+                parse_mode: 'HTML',
+                reply_markup
+            }).catch(() => {});
+        }
+
+        // Handle GC Entry Drop text
+        if (ctx.session?.state === 'AWAITING_WARMUP_CONTENT') {
+            const sessionKey = ctx.session.warmupNode;
+            ctx.session.state = 'IDLE';
+            ctx.session.warmupNode = null;
+            const phone = sessionKey?.split('_')[1] || sessionKey;
+            const cfgPath = require('path').join(__dirname, '../data', `warmup-config-${phone}.json`);
+            const existing = require('fs').existsSync(cfgPath) ? JSON.parse(require('fs').readFileSync(cfgPath, 'utf8')) : {};
+            existing.statusPayload = text; existing.mediaType = null;
+            require('fs').writeFileSync(cfgPath, JSON.stringify(existing, null, 2));
+            const confirmMsg = await ctx.reply(`✅ <b>Saved!</b> GC Entry Drop set for +${phone}.`, { parse_mode: 'HTML' });
+            setTimeout(async () => {
+                await ctx.telegram.deleteMessage(ctx.chat.id, confirmMsg.message_id).catch(() => {});
+                const sock = activeSockets.get(sessionKey);
+                const isOnline = sock?.user ? 'Online 🟢' : 'Offline ⏳';
+                const panel = getNodeControlView(sessionKey, String(ctx.from?.id || ''));
+                ctx.reply(panel.text, { parse_mode: 'HTML', reply_markup: panel.reply_markup }).catch(() => {});
+            }, 1500);
+            return;
+        }
+
+        // Handle sudo add input
+        if (ctx.session?.sudoAction === 'add') {
+            if (!rbac.hasRolePermission(userRole, 'OWNER')) {
+                return ctx.reply('⚠️ Access denied. Only OWNER can modify sudo users.', { parse_mode: 'HTML' });
+            }
+            ctx.session.sudoAction = null;
+            const phone = text.replace(/[^0-9]/g, '');
+            if (!phone) return ctx.reply('❌ Invalid number.');
+            const jid = `${phone}@s.whatsapp.net`;
+            await ownerManager.addSudo(jid);
+            return ctx.reply(`✅ <b>Added sudo:</b> <code>${jid}</code>`, {
+                parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '👑 Back to Sudo Menu', callback_data: 'menu_sudo', style: 'primary' }]] }
+            });
+        }
+
+        // Handle Set GC Entry Drop (warmup) input
+        if (ctx.session?.gcStatusNode) {
+            if (!rbac.hasRolePermission(userRole, 'SUDO')) {
+                return ctx.reply('⚠️ Access denied. Your role cannot configure GC Entry Drop.', { parse_mode: 'HTML' });
+            }
+            const sessionKey = ctx.session.gcStatusNode;
+            ctx.session.gcStatusNode = null;
+            const sock = activeSockets.get(sessionKey);
+            if (!sock?.user) return ctx.reply('❌ Node is offline.');
+            const phone = sessionKey.split('_')[1] || sessionKey;
+            
+            // Save to warmup config for this specific node
+            const cfgPath = path.join(__dirname, '../data', `warmup-config-${phone}.json`);
+            const warmupConfig = { statusPayload: text, mediaType: null };
+            await fsp.writeFile(cfgPath, JSON.stringify(warmupConfig, null, 2), 'utf8').catch(() => {});
+            
+            // Instant confirmation — user knows it was received
+            const confirmMsg = await ctx.reply(
+                `🔥 <b>GC ENTRY DROP LOCKED IN</b>\n\n📱 Node: <code>+${phone}</code>\n📝 Content: <i>${text.slice(0, 80)}${text.length > 80 ? '...' : ''}</i>\n\n✅ This will auto-fire when the bot joins a new group.`,
+                { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }]] } }
+            );
+            return;
+        }
+
+        // Handle owner number prompt for auto-pair flow.
+        if (ctx.session?.awaitingPairOwnerForPhone) {
+            const pendingPhone = String(ctx.session.awaitingPairOwnerForPhone || '');
+            const tgId = String(ctx.from?.id || '');
+            ctx.session.awaitingPairOwnerForPhone = null;
+
+            const ownerInput = text.trim().toLowerCase();
+            const customOwnerDigits = ownerInput === 'skip' ? null : text.replace(/\D/g, '');
+            if (customOwnerDigits && (customOwnerDigits.length < 9 || customOwnerDigits.length > 15)) {
+                return ctx.reply('❌ Invalid owner number. Send a valid number or type <code>skip</code>.', { parse_mode: 'HTML' });
+            }
+
+            const pairingRegistry = require('../modules/pairingRegistry');
+            if (tgId !== String(ownerTelegramId) && pairingRegistry.hasBot(tgId)) {
+                const existing = pairingRegistry.getPhone(tgId);
+                return ctx.reply(
+                    `⚠️ <b>You already have a bot paired!</b>\n\n📱 Number: <code>+${existing}</code>\n\n<i>You can only pair one number. Use /rmsession to remove it first.</i>`,
+                    { parse_mode: 'HTML' }
+                );
+            }
+
+            try {
+                const ownerJid = customOwnerDigits
+                    ? `${customOwnerDigits}@s.whatsapp.net`
+                    : await ownerManager.registerPairedNumber(pendingPhone);
+                if (customOwnerDigits) await ownerManager.addOwner(ownerJid);
+
+                await ctx.reply(
+                    `✅ <b>Owner assigned:</b> <code>${ownerJid}</code>\n⚙️ <b>Starting pairing for</b> <code>+${pendingPhone}</code>...`,
+                    { parse_mode: 'HTML' }
+                );
+
+                // Mark as pairing in progress so auto-pair doesn't re-trigger
+                ctx.session.pairingInProgress = pendingPhone;
+                await startWhatsApp(tgId, pendingPhone, '1');
+                await pairingRegistry.register(tgId, pendingPhone).catch(() => {});
+                ctx.session.pairingInProgress = null;
+                return;
+            } catch (err) {
+                const msg = err?.message || String(err);
+                return ctx.reply(`❌ <b>ERROR:</b>\n<code>${msg}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+            }
+        }
+
+        // Auto-feed WhatsApp links from Telegram to intel autojoin queue
+        if (text.includes('chat.whatsapp.com')) {
+            try {
+                const { default: intelPlugin } = await Promise.resolve().then(() => ({ default: require('../plugins/pappy-intel') }));
+                const links = text.match(/chat\.whatsapp\.com\/([0-9A-Za-z]{20,24})/ig);
+                if (links?.length) {
+                    // Emit as a fake message.upsert event so intel daemon picks it up
+                    const eventBus = require('./eventBus');
+                    eventBus.emit('message.upsert', { text });
+                    ctx.reply(`📡 <b>${links.length} link(s) queued for auto-join</b>`, { parse_mode: 'HTML' }).catch(() => {});
+                }
+            } catch {}
+        }
+
+        // Auto-pair: if enabled and user sends just a phone number in DM, collect owner number first.
+        // Never trigger auto-pair in groups — DM only
+        if (botState.autoPairEnabled && !isGroupChat && !ctx.session?.pairingInProgress) {
+            const cleanText = text.trim();
+            const phoneMatch = cleanText.match(/^(\+?[\d\s\-().]+)$/);
+            const phoneNum = phoneMatch ? cleanText.replace(/\D/g, '') : null;
+            
+            // Valid phone number: 9-15 digits (covers most international formats)
+            if (phoneNum && phoneNum.length >= 9 && phoneNum.length <= 15) {
+                const tgId = String(ctx.from?.id || '');
+                const pairingRegistry = require('../modules/pairingRegistry');
+                
+                // Check if user already has a bot paired (unless owner)
+                if (tgId !== String(ownerTelegramId) && pairingRegistry.hasBot(tgId)) {
+                    const existing = pairingRegistry.getPhone(tgId);
+                    return ctx.reply(
+                        `⚠️ <b>You already have a bot paired!</b>\n\n📱 Number: <code>+${existing}</code>\n\n<i>You can only pair one number. Use /rmsession to remove it first.</i>`,
+                        { parse_mode: 'HTML' }
+                    );
+                }
+
+                ctx.session = ctx.session || {};
+                ctx.session.awaitingPairOwnerForPhone = phoneNum;
+                await ctx.reply(
+                    `📱 <b>Number received:</b> <code>+${phoneNum}</code>\n\nSend owner WhatsApp number to assign OWNER before pairing, or type <code>skip</code> to use this same number as owner.`,
+                    { parse_mode: 'HTML' }
+                );
+                return; // Don't continue to other handlers
+            }
+        }
+
+        // ─── /exitchat slash command ───────────────────────────────────
+        if (text.trim().toLowerCase() === '/exitchat') {
+            ctx.session = ctx.session || {};
+            ctx.session.activeChatNode = null;
+            return ctx.reply('✅ Chat Mode deactivated. Commands will auto-route again.', { parse_mode: 'HTML' });
+        }
+
+        if (!text.startsWith('.')) return next();
+
+        if (!rbac.hasRolePermission(userRole, 'ADMIN')) {
+            logger.warn('[RBAC] Telegram bridge denied', { userId, role: userRole, command: text.split(' ')[0] });
+            return ctx.reply('⚠️ Access denied. Dot commands require ADMIN role or higher.', { parse_mode: 'HTML' });
+        }
+
+        const args = text.trim().split(/ +/);
+        const commandName = args.shift().toLowerCase();
+        if (commandName === '.sticker' || commandName === '.s') {
+            return ctx.reply('Use /sticker and send image/video. Auto-sticker is enabled for incoming media.', { parse_mode: 'HTML' });
+        }
+
+        // Use activeChatNode if user has entered Chat Mode for a specific node
+        const activeChatNode = ctx.session?.activeChatNode || null;
+        if (commandName === '.menu' && !activeChatNode) {
+            return ctx.reply('⚠️ Global .menu is disabled. Enter a node and enable Chat Mode first, then run .menu there.', { parse_mode: 'HTML' });
+        }
+        const scoped = resolveTelegramNodeScope(userId, userRole, activeChatNode || undefined);
+        const firstActiveSocket = scoped?.sock || null;
+        if (!firstActiveSocket) return ctx.reply('❌ <b>No active WhatsApp nodes for your Telegram ID.</b> Pair your own node first.', { parse_mode: 'HTML' });
+
+        // Fix: use static PLUGIN_REGISTRY — eliminates dynamic require(variable) in bridge
+        const targetPlugin = PLUGIN_REGISTRY.get(commandName) || null;
+
+        if (!targetPlugin) return ctx.reply(`❌ Unknown WhatsApp command: <code>${commandName}</code>`, { parse_mode: 'HTML' });
+
+        const botId = firstActiveSocket.user.id.split(':')[0];
+        const botJid = `${botId}@s.whatsapp.net`;
+        const mockMsg = {
+            key: { remoteJid: botJid, fromMe: false, id: `TG_CMD_${Date.now()}` },
+            message: { conversation: text },
+            pushName: 'Telegram'
+        };
+        const roleMap = { OWNER: 'owner', SUDO: 'owner', ADMIN: 'admin', USER: 'public' };
+        const mockUserProfile = { role: roleMap[userRole] || 'public', name: 'Telegram', stats: { commandsUsed: 0 }, activity: { isBanned: false } };
+
+        // Broadcast commands — use real socket, no bridge proxy to avoid spam
+        const broadcastCmds = new Set(['.godcast', '.gcast', '.schedulecast', '.schedulegodcast', '.loopcast', '.loopgodcast', '.stopcast']);
+        if (broadcastCmds.has(commandName)) {
+            if (!rbac.hasRolePermission(userRole, 'SUDO')) {
+                return ctx.reply('⚠️ Access denied. Broadcast commands require SUDO role or higher.', { parse_mode: 'HTML' });
+            }
+            const statusMsg = await ctx.reply('🚀 <b>Broadcast starting...</b>', { parse_mode: 'HTML' });
+
+            // Store TG context globally so broadcast can update it
+            global._tgBroadcastCtx = { chatId: ctx.chat.id, msgId: statusMsg.message_id };
+
+            const broadcastMsg = {
+                key: { remoteJid: botJid, fromMe: false, id: `TG_BCAST_${Date.now()}` },
+                message: { conversation: text },
+                pushName: 'Telegram'
+            };
+            taskManager.submit(makeTelegramTaskId('TG_EXEC', userId, scoped?.sessionKey), async (abortSignal) => {
+                await targetPlugin.execute({ sock: firstActiveSocket, msg: broadcastMsg, args: text.trim().split(/ +/).slice(1), text, user: mockUserProfile, botId, abortSignal });
+            }, { priority: 5, timeout: 600000 }).catch(err => {
+                ctx.reply(`❌ <b>Plugin Error:</b> ${err.message}`, { parse_mode: 'HTML' });
+                global._tgBroadcastCtx = null;
+            });
+            return;
+        }
+
+        // 🪞 Proxy socket to redirect WhatsApp responses back to Telegram
+        // Text-only intermediate messages (searching, please wait, errors) are suppressed
+        // Audio/video/image payloads are forwarded directly
+        const bridgeSock = new Proxy(firstActiveSocket, {
+            get(target, prop) {
+                if (prop === 'sendMessage') {
+                    return async (jid, payload, ...rest) => {
+                        try {
+                            if (payload.audio) {
+                                return ctx.replyWithAudio({ source: Buffer.isBuffer(payload.audio) ? payload.audio : Buffer.from(payload.audio) }, {
+                                    title: payload.contextInfo?.externalAdReply?.title || '',
+                                    performer: payload.contextInfo?.externalAdReply?.body || '',
+                                });
+                            } else if (payload.image) {
+                                const caption = (payload.caption || '').slice(0, 1024);
+                                return ctx.replyWithPhoto({ source: Buffer.isBuffer(payload.image) ? payload.image : Buffer.from(payload.image) }, { caption });
+                            } else if (payload.video) {
+                                const caption = (payload.caption || '').slice(0, 1024);
+                                return ctx.replyWithVideo({ source: Buffer.isBuffer(payload.video) ? payload.video : Buffer.from(payload.video) }, { caption });
+                            } else if (payload.text) {
+                                const t = payload.text;
+                                // Suppress heavy broadcast progress spam but allow useful feedback through
+                                const isNoise =
+                                    t.includes('ENGINE ENGAGED') || t.includes('GODCAST') ||
+                                    t.includes('GCAST') || t.includes('STARTED') ||
+                                    t.includes('COMPLETE') || t.includes('IN PROGRESS') ||
+                                    t.includes('drops') || t.includes('Sent:') ||
+                                    t.split('\n').length > 8;
+                                if (!isNoise) {
+                                    return ctx.reply(`📱 <b>NODE FEEDBACK:</b>\n${t}`, { parse_mode: 'HTML' });
+                                }
+                            }
+                        } catch { /* ignore bridge send errors */ }
+                    };
+                }
+                return target[prop];
+            }
+        });
+
+        const runBridgeCommand = async (abortSignal) => {
+            await targetPlugin.execute({ sock: bridgeSock, msg: mockMsg, args, text, user: mockUserProfile, botId, abortSignal });
+        };
+
+        // Split-path dispatch: lightweight/user-facing commands execute instantly.
+        const isInstant = TG_INSTANT_DOT_COMMANDS.has(commandName);
+        const mustQueue = TG_HEAVY_QUEUED_DOT_COMMANDS.has(commandName);
+        if (isInstant && !mustQueue) {
+            return runBridgeCommand(undefined).catch(err => ctx.reply(`❌ <b>Plugin Error:</b> ${err.message}`, { parse_mode: 'HTML' }));
+        }
+
+        // Default queued path for non-instant or heavy commands
+        taskManager.submit(makeTelegramTaskId('TG_EXEC', userId, scoped?.sessionKey), async (abortSignal) => {
+            await runBridgeCommand(abortSignal);
+        }, { priority: 5, timeout: 60000 }).catch(err => ctx.reply(`❌ <b>Plugin Error:</b> ${err.message}`, { parse_mode: 'HTML' }));
+    });
+
+    bot.command('sticker', async (ctx) => {
+        return ctx.reply(
+            '📌 Send an image/video and I can convert it to sticker.\nUse /autosticker on to auto-convert every media.\nUse #url in caption to force URL output instead.',
+            { parse_mode: 'HTML' }
+        );
+    });
+
+    // ==========================================
+    // 🎴 STICKER PACK MANAGEMENT
+    // ==========================================
+    bot.action(/^spack_add_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const msgId = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userName = ctx.from?.first_name || 'User';
+
+        try {
+            // Get the stored buffer for this sticker
+            const stickerBuffer = getStickerBuffer(msgId);
+            if (!stickerBuffer) return ctx.reply('❌ Sticker expired. Generate a new one and try again.');
+
+            // Upload sticker file to Telegram to get a proper file reference
+            const uploaded = await ctx.telegram.callApi('uploadStickerFile', {
+                user_id: Number(userId),
+                sticker: { source: stickerBuffer, filename: 'sticker.webm' },
+                sticker_format: 'video',
+            });
+            const uploadedFileId = uploaded.file_id;
+
+            let pack = stickerPackManager.getUserPack(userId);
+            const packName = stickerPackManager.getPackName(userId);
+
+            const createPack = async () => {
+                await stickerPackManager.clearPack(userId);
+                await ctx.telegram.callApi('createNewStickerSet', {
+                    user_id: Number(userId),
+                    name: packName,
+                    title: stickerPackManager.getPackTitle(userName),
+                    stickers: [{ sticker: uploadedFileId, emoji_list: ['🔥'], format: 'video' }],
+                    sticker_type: 'regular',
+                });
+                await stickerPackManager.registerPack(userId, userName);
+                await stickerPackManager.addStickerToRecord(userId, msgId);
+            };
+
+            if (!pack) {
+                await createPack();
+                return ctx.reply(`✅ <b>Pack created!</b>\n\n<a href="https://t.me/addstickers/${packName}">👉 Open your pack</a>`, { parse_mode: 'HTML' });
+            }
+
+            try {
+                await ctx.telegram.callApi('addStickerToSet', {
+                    user_id: Number(userId),
+                    name: packName,
+                    sticker: { sticker: uploadedFileId, emoji_list: ['🔥'], format: 'video' },
+                });
+            } catch (addErr) {
+                const desc = String(addErr?.description || addErr?.message || '');
+                if (desc.includes('STICKERSET_INVALID')) {
+                    // Pack was deleted on Telegram side — recreate it
+                    await createPack();
+                    return ctx.reply(`✅ <b>Pack recreated!</b>\n\n<a href="https://t.me/addstickers/${packName}">👉 Open your pack</a>`, { parse_mode: 'HTML' });
+                }
+                throw addErr;
+            }
+            await stickerPackManager.addStickerToRecord(userId, msgId);
+            return ctx.reply(`✅ <b>Sticker added!</b>\n\n<a href="https://t.me/addstickers/${packName}">👉 Open your pack</a>`, { parse_mode: 'HTML' });
+        } catch (e) {
+            const msg = e?.description || e?.message || String(e);
+            return ctx.reply(`❌ Failed: <code>${msg}</code>`, { parse_mode: 'HTML' });
+        }
+    });
+
+    bot.action(/^spack_del_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const fileId = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+
+        try {
+            await ctx.telegram.deleteStickerFromSet(fileId);
+            await stickerPackManager.removeStickerFromRecord(userId, fileId);
+            return ctx.reply('✅ Sticker removed from your pack.');
+        } catch (e) {
+            const msg = e?.description || e?.message || String(e);
+            return ctx.reply(`❌ Failed: <code>${msg}</code>`, { parse_mode: 'HTML' });
+        }
+    });
+
+    bot.action('spack_view', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        const pack = stickerPackManager.getUserPack(userId);
+        if (!pack) {
+            return ctx.reply('⚠️ You don\'t have a pack yet. Generate a sticker and tap <b>Add to My Pack</b>.', { parse_mode: 'HTML' });
+        }
+        const packName = stickerPackManager.getPackName(userId);
+        return ctx.reply(
+            `📦 <b>Your Sticker Pack</b>\n\nName: <code>${packName}</code>\nStickers: <b>${pack.stickers.length}</b>\n\n<a href="https://t.me/addstickers/${packName}">👉 Open / Share Pack</a>`,
+            { parse_mode: 'HTML' }
+        );
+    });
+
+    bot.command('mypack', async (ctx) => {
+        const userId = String(ctx.from?.id || '');
+        const pack = stickerPackManager.getUserPack(userId);
+        if (!pack) {
+            return ctx.reply('⚠️ No pack yet. Generate a sticker and tap <b>Add to My Pack</b>.', { parse_mode: 'HTML' });
+        }
+        const packName = stickerPackManager.getPackName(userId);
+        return ctx.reply(
+            `📦 <b>Your Sticker Pack</b>\n\nName: <code>${packName}</code>\nStickers: <b>${pack.stickers.length}</b>\n\n<a href="https://t.me/addstickers/${packName}">👉 Open / Share Pack</a>`,
+            { parse_mode: 'HTML' }
+        );
+    });
+
+    bot.command('gprotect', async (ctx) => {
+        if (!isTelegramGroupChat(ctx)) {
+            return ctx.reply('🛡️ Use <code>/gprotect</code> inside your Telegram group.', { parse_mode: 'HTML' });
+        }
+        const userId = Number(ctx.from?.id || 0);
+        const userRole = ctx.state?.userRole || rbac.getUserRole(String(ctx.from?.id || ''));
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, userId);
+        if (!isAdmin && !rbac.hasRolePermission(userRole, 'ADMIN')) {
+            return ctx.reply('⚠️ Group admin access required.', { parse_mode: 'HTML' });
+        }
+        const cfg = getGroupProtectConfig(String(ctx.chat.id));
+        const view = getGroupProtectionView(String(ctx.chat.id), cfg);
+        return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+    });
+
+    const getReplyTargetUser = (ctx) => {
+        const replied = ctx.message?.reply_to_message?.from;
+        if (!replied?.id) return null;
+        return { id: Number(replied.id), mention: mentionUserHtml(replied) };
+    };
+
+    const ensureGroupAdminCommand = async (ctx) => {
+        if (!isTelegramGroupChat(ctx)) {
+            await ctx.reply('⚠️ This command works in groups only.', { parse_mode: 'HTML' }).catch(() => {});
+            return false;
+        }
+        const isAdmin = await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(ctx.from?.id || 0));
+        if (!isAdmin) {
+            await ctx.reply('⚠️ Group admin only.', { parse_mode: 'HTML' }).catch(() => {});
+            return false;
+        }
+        return true;
+    };
+
+    bot.command('warn', async (ctx) => {
+        if (!await ensureGroupAdminCommand(ctx)) return;
+        const target = getReplyTargetUser(ctx);
+        if (!target) return ctx.reply('Reply to a member with <code>/warn reason</code>.', { parse_mode: 'HTML' });
+        const cfg = getGroupProtectConfig(String(ctx.chat.id));
+        const key = String(target.id);
+        const row = cfg.warns[key] || { count: 0, updatedAt: 0 };
+        row.count += 1;
+        row.updatedAt = Date.now();
+        cfg.warns[key] = row;
+        setGroupProtectConfig(String(ctx.chat.id), cfg);
+        return ctx.reply(`⚠️ ${target.mention} warned. Total warnings: <b>${row.count}</b>.`, { parse_mode: 'HTML' });
+    });
+
+    bot.command('kick', async (ctx) => {
+        if (!await ensureGroupAdminCommand(ctx)) return;
+        const target = getReplyTargetUser(ctx);
+        if (!target) return ctx.reply('Reply to a member with <code>/kick</code>.', { parse_mode: 'HTML' });
+        await ctx.telegram.banChatMember(ctx.chat.id, target.id).catch(() => {});
+        await ctx.telegram.unbanChatMember(ctx.chat.id, target.id, { only_if_banned: true }).catch(() => {});
+        return ctx.reply(`👢 Kicked ${target.mention}.`, { parse_mode: 'HTML' });
+    });
+
+    bot.command('ban', async (ctx) => {
+        if (!await ensureGroupAdminCommand(ctx)) return;
+        const target = getReplyTargetUser(ctx);
+        if (!target) return ctx.reply('Reply to a member with <code>/ban</code>.', { parse_mode: 'HTML' });
+        await ctx.telegram.banChatMember(ctx.chat.id, target.id).catch(() => {});
+        return ctx.reply(`⛔ Banned ${target.mention}.`, { parse_mode: 'HTML' });
+    });
+
+    bot.command('mute', async (ctx) => {
+        if (!await ensureGroupAdminCommand(ctx)) return;
+        const target = getReplyTargetUser(ctx);
+        if (!target) return ctx.reply('Reply to a member with <code>/mute 30</code> (minutes).', { parse_mode: 'HTML' });
+        const mins = Math.max(1, Number(String(ctx.message?.text || '').trim().split(/\s+/)[1] || 60));
+        await ctx.telegram.restrictChatMember(ctx.chat.id, target.id, {
+            permissions: {
+                can_send_messages: false,
+                can_send_audios: false,
+                can_send_documents: false,
+                can_send_photos: false,
+                can_send_videos: false,
+                can_send_video_notes: false,
+                can_send_voice_notes: false,
+                can_send_polls: false,
+                can_send_other_messages: false,
+                can_add_web_page_previews: false,
+                can_change_info: false,
+                can_invite_users: false,
+                can_pin_messages: false,
+                can_manage_topics: false,
+            },
+            until_date: Math.floor(Date.now() / 1000) + (mins * 60),
+        }).catch(() => {});
+        return ctx.reply(`🔇 Muted ${target.mention} for <b>${mins}</b> minute(s).`, { parse_mode: 'HTML' });
+    });
+
+    bot.command('unmute', async (ctx) => {
+        if (!await ensureGroupAdminCommand(ctx)) return;
+        const target = getReplyTargetUser(ctx);
+        if (!target) return ctx.reply('Reply to a member with <code>/unmute</code>.', { parse_mode: 'HTML' });
+        await ctx.telegram.restrictChatMember(ctx.chat.id, target.id, {
+            permissions: {
+                can_send_messages: true,
+                can_send_audios: true,
+                can_send_documents: true,
+                can_send_photos: true,
+                can_send_videos: true,
+                can_send_video_notes: true,
+                can_send_voice_notes: true,
+                can_send_polls: true,
+                can_send_other_messages: true,
+                can_add_web_page_previews: true,
+                can_change_info: false,
+                can_invite_users: true,
+                can_pin_messages: false,
+                can_manage_topics: false,
+            },
+        }).catch(() => {});
+        return ctx.reply(`🔊 Unmuted ${target.mention}.`, { parse_mode: 'HTML' });
+    });
+
+    const handleTagAllCommand = async (ctx) => {
+        if (!await ensureGroupAdminCommand(ctx)) return;
+        try {
+            const chatId = String(ctx.chat.id);
+            const customMessage = String(ctx.message?.text || '').replace(/^\/(?:tagall|tafall)\s*/i, '').trim();
+            const totalMembers = await ctx.telegram.getChatMembersCount(chatId).catch(() => 0);
+
+            // Collect tracked members for this group
+            const trackedMap = tgGroupMembersState.get(chatId);
+            const trackedMembers = trackedMap ? [...trackedMap.entries()] : [];
+
+            // Also get admins (always available)
+            const adminUsers = [];
+            const seenIds = new Set(trackedMembers.map(([uid]) => uid));
+            try {
+                const admins = await ctx.telegram.getChatAdministrators(chatId);
+                for (const a of admins) {
+                    if (a?.user && !a.user.is_bot && !seenIds.has(String(a.user.id))) {
+                        adminUsers.push([String(a.user.id), {
+                            first_name: a.user.first_name || '',
+                            username: a.user.username || ''
+                        }]);
+                        seenIds.add(String(a.user.id));
+                    }
+                }
+            } catch {}
+
+            const allMembers = [...trackedMembers, ...adminUsers];
+
+            if (!allMembers.length) {
+                return ctx.reply(
+                    '⚠️ No members tracked yet. Members are tracked as they chat — ask everyone to send a message first, or try again after some activity.',
+                    { parse_mode: 'HTML' }
+                ).catch(() => {});
+            }
+
+            // Build mention list using tg://user link (works for users without @username)
+            const mentions = allMembers.map(([uid, info]) => {
+                if (info.username) return `@${info.username}`;
+                return `<a href="tg://user?id=${uid}">${escapeHtml(info.first_name || uid)}</a>`;
+            });
+
+            const coverage = totalMembers > 0
+                ? `<i>Tagged ${allMembers.length}/${totalMembers} known members</i>\n\n`
+                : '';
+            const header = customMessage
+                ? `${escapeHtml(customMessage)}\n${coverage}`
+                : `📣 <b>Attention everyone!</b>\n${coverage}`;
+
+            // Split into chunks of 4000 chars
+            const chunks = [];
+            let current = header;
+            for (const m of mentions) {
+                if ((current + m + ' ').length > 4000) {
+                    chunks.push(current.trimEnd());
+                    current = '📣 <b>Continued...</b>\n\n' + m + ' ';
+                } else {
+                    current += m + ' ';
+                }
+            }
+            if (current.replace(/^📣.*?\n\n/, '').trim()) chunks.push(current.trimEnd());
+
+            for (let i = 0; i < chunks.length; i++) {
+                await ctx.telegram.sendMessage(chatId, chunks[i], {
+                    parse_mode: 'HTML',
+                    reply_to_message_id: ctx.message.message_id
+                }).catch(() => {});
+                if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 300));
+            }
+
+        } catch (err) {
+            logger.error('[Telegram] /tagall failed', { error: err.message, chat: ctx.chat.id });
+            return ctx.reply(`❌ Tag failed: <code>${escapeHtml(err.message || String(err))}</code>`, { parse_mode: 'HTML' });
+        }
+    };
+
+    bot.command('tagall', handleTagAllCommand);
+    bot.command('tafall', handleTagAllCommand);
+
+    bot.on('new_chat_members', async (ctx, next) => {
+        if (!isTelegramGroupChat(ctx)) return next();
+
+        // Track new members
+        const newMembers = Array.isArray(ctx.message?.new_chat_members) ? ctx.message.new_chat_members : [];
+        const chatId = String(ctx.chat.id);
+        for (const member of newMembers) {
+            if (member && !member.is_bot) {
+                if (!tgGroupMembersState.has(chatId)) tgGroupMembersState.set(chatId, new Map());
+                tgGroupMembersState.get(chatId).set(String(member.id), {
+                    first_name: member.first_name || '',
+                    username: member.username || '',
+                    last_seen: Date.now()
+                });
+            }
+        }
+
+        const cfg = getGroupProtectConfig(chatId);
+        if (!cfg.welcome?.enabled) return next();
+
+        const members = newMembers;
+        if (!members.length) return next();
+
+        for (const member of members) {
+            const mention = mentionUserHtml(member);
+            let welcomeText = cfg.welcome?.textTemplate
+                ? String(cfg.welcome.textTemplate).replace(/\{user\}/g, mention).replace(/\{group\}/g, escapeHtml(ctx.chat?.title || 'this group'))
+                : `👋 Welcome ${mention} to <b>${escapeHtml(ctx.chat?.title || 'the group')}</b>!`;
+
+            if (cfg.welcome?.useAi && ai) {
+                try {
+                    const aiPrompt = `Write a short warm Telegram group welcome for ${member.first_name || 'new member'} joining ${ctx.chat?.title || 'our group'}. Keep it friendly and energetic.`;
+                    const aiText = await ai.generateText(aiPrompt, String(ctx.from?.id || ''), { platform: 'telegram', role: 'admin', extra: 'Return plain text only.' });
+                    if (aiText) welcomeText = `${mention} ${escapeHtml(String(aiText).slice(0, 400))}`;
+                } catch {}
+            }
+
+            await ctx.reply(welcomeText, { parse_mode: 'HTML' }).catch(() => {});
+
+            const mediaType = cfg.welcome?.media?.type;
+            const mediaFileId = cfg.welcome?.media?.fileId;
+            if (mediaType && mediaFileId) {
+                if (mediaType === 'photo') await ctx.replyWithPhoto(mediaFileId).catch(() => {});
+                if (mediaType === 'video') await ctx.replyWithVideo(mediaFileId).catch(() => {});
+                if (mediaType === 'audio') await ctx.replyWithAudio(mediaFileId).catch(() => {});
+            }
+        }
+        return next();
+    });
+
+    bot.command('autosticker', async (ctx) => {
+        const parts = String(ctx.message?.text || '').trim().split(/\s+/);
+        const arg = (parts[1] || '').toLowerCase();
+        const userId = String(ctx.from?.id || '');
+        if (arg === 'on') {
+            setAutoStickerStateForUser(userId, true);
+            return ctx.reply('✅ Auto Sticker: ON\nSend image/video and it will become sticker automatically.', { parse_mode: 'HTML' });
+        }
+        if (arg === 'off') {
+            setAutoStickerStateForUser(userId, false);
+            return ctx.reply('✅ Auto Sticker: OFF\nMedia will follow URL tools/warmup behavior.', { parse_mode: 'HTML' });
+        }
+
+        const isOn = getAutoStickerStateForUser(userId);
+        return ctx.reply(
+            `⚙️ Auto Sticker is currently <b>${isOn ? 'ON' : 'OFF'}</b>.\nUse <code>/autosticker on</code> or <code>/autosticker off</code>.`,
+            { parse_mode: 'HTML' }
+        );
+    });
+
+    bot.command('cmdplain', async (ctx) => {
+        const { text, reply_markup } = getPlainListView(String(ctx.from?.id || ''));
+        return ctx.reply(text, { parse_mode: 'HTML', reply_markup });
+    });
+
+    bot.command('supportinbox', async (ctx) => {
+        return openSupportInbox(ctx, 'all');
+    });
+
+    bot.command('queues', async (ctx) => {
+        try {
+            const { getQueueDebugSnapshot } = require('./bullEngine');
+            const snapshot = await getQueueDebugSnapshot();
+            const lines = [
+                '🧵 <b>QUEUE SHARDS</b>',
+                `Node ID: <code>${snapshot.nodeId}</code>`,
+                `Shards: <b>${snapshot.shardCount}</b>`,
+                '',
+            ];
+
+            if (!snapshot.shards.length) {
+                lines.push('<i>No active queue shards yet.</i>');
+            } else {
+                snapshot.shards.forEach((shard, idx) => {
+                    const counts = shard.counts || {};
+                    lines.push(
+                        `${idx + 1}. <code>${shard.queueName}</code>`,
+                        `worker: <b>${shard.workerAttached ? 'yes' : 'no'}</b>`,
+                        `waiting=${counts.waiting || 0} active=${counts.active || 0} delayed=${counts.delayed || 0} failed=${counts.failed || 0} completed=${counts.completed || 0}`,
+                        ''
+                    );
+                });
+            }
+
+            return ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
+        } catch (err) {
+            return ctx.reply(`❌ <b>Queue debug failed:</b> ${err.message}`, { parse_mode: 'HTML' });
+        }
+    });
+
+    // ── IDE-style action handlers ─────────────────────────────────────────
+    // Cancel running process
+    bot.action(/^aiproc_cancel_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery('Cancelling...').catch(() => {});
+        const key = ctx.match[1];
+        const proc = global._aiProcs?.get(key);
+        if (proc) { proc.cancel(); ctx.answerCbQuery('🔴 Cancelled').catch(() => {}); }
+        else ctx.answerCbQuery('Already done').catch(() => {});
+    });
+
+    // Approve suggested command
+    bot.action(/^aisugg_approve_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery('✅ Running...').catch(() => {});
+        const key = ctx.match[1];
+        const sug = global._aiSuggestions?.get(key);
+        if (!sug) return ctx.answerCbQuery('Expired').catch(() => {});
+        global._aiSuggestions.delete(key);
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        // Trigger as EXECUTE_COMMAND
+        const fakeReply = `EXECUTE_COMMAND:${sug.command}`;
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || 'OWNER';
+        await ctx.reply(`▶️ Running: <code>${escapeHtml(sug.command)}</code>`, { parse_mode: 'HTML' });
+        const { spawn } = require('child_process');
+        let out = '';
+        await new Promise(r => {
+            const p = spawn('bash', ['-c', sug.command], { timeout: 30000 });
+            p.stdout.on('data', d => { out += d.toString(); });
+            p.stderr.on('data', d => { out += d.toString(); });
+            p.on('close', r); p.on('error', r);
+        });
+        const display = out.slice(-3000) || 'done (no output)';
+        await ctx.reply(`🟢 <b>Done:</b>\n<pre>${escapeHtml(display)}</pre>`, { parse_mode: 'HTML' });
+    });
+
+    // Reject suggested command
+    bot.action(/^aisugg_reject_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery('❌ Rejected').catch(() => {});
+        const key = ctx.match[1];
+        global._aiSuggestions?.delete(key);
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        await ctx.reply('❌ Suggestion rejected.').catch(() => {});
+    });
+
+    // Allow file read
+    bot.action(/^aifile_allow_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery('Reading...').catch(() => {});
+        const key = ctx.match[1];
+        const entry = global._aiSuggestions?.get(key);
+        if (!entry) return ctx.answerCbQuery('Expired').catch(() => {});
+        global._aiSuggestions.delete(key);
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        try {
+            const fs = require('fs');
+            const content = fs.readFileSync(entry.path, 'utf8').slice(0, 3000);
+            await ctx.reply(`📄 <b>${entry.path}</b>\n\n<pre>${escapeHtml(content)}</pre>`, { parse_mode: 'HTML' });
+        } catch (e) {
+            await ctx.reply(`❌ Could not read file: ${e.message}`);
+        }
+    });
+
+    // Cancel file read/edit
+    bot.action(/^aifile_cancel_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery('🚫 Cancelled').catch(() => {});
+        const key = ctx.match[1];
+        global._aiSuggestions?.delete(key);
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+    });
+
+    // ── IDE AI — /ide command + persistent pipeline ────────────────────────────────
+    const ideSessions = new Map(); // userId -> { cwd, plan, iteration }
+    const { runIdePipeline } = require('./ideAgents');
+
+    async function runIdeForUser(ctx, userRequest) {
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!rbac.hasRolePermission(userRole, 'ADMIN')) {
+            return ctx.reply('⚠️ IDE requires ADMIN role or above.').catch(() => {});
+        }
+
+        if (!ideSessions.has(userId)) ideSessions.set(userId, { cwd: '/root', userId });
+        const session = ideSessions.get(userId);
+
+        const globalApiCfg = getGlobalAiSettings();
+        const apiConfig = { provider: globalApiCfg.provider, model: globalApiCfg.model, apiKey: globalApiCfg.apiKey };
+
+        // Status message
+        const statusMsg = await ctx.reply(
+            `🧠 <b>IDE AI Starting...</b>\n\n📝 Planning your request...`,
+            { parse_mode: 'HTML' }
+        ).catch(() => null);
+
+        const edit = async (text, markup = null) => {
+            if (!statusMsg) return;
+            const opts = { parse_mode: 'HTML' };
+            if (markup) opts.reply_markup = markup;
+            await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, text, opts).catch(() => {});
+        };
+
+        let actionLog = '';
+        let planText = '';
+
+        try {
+            await runIdePipeline(userRequest, session, apiConfig, {
+                onPlanReady: async (plan) => {
+                    planText = plan;
+                    const goalLine = plan.match(/GOAL:\s*(.+)/)?.[1] || 'Working...';
+                    const steps = (plan.match(/STEPS:[\s\S]*?(?=TECH:|$)/)?.[0] || '').replace('STEPS:', '').trim();
+                    await edit(
+                        `📝 <b>Plan Ready</b>\n\n🎯 <b>Goal:</b> ${escapeHtml(goalLine)}\n\n📋 <b>Steps:</b>\n<pre>${escapeHtml(steps.slice(0, 800))}</pre>\n\n⏳ Executing...`,
+                        { inline_keyboard: [[{ text: '🔴 Cancel', callback_data: `ide_cancel_${userId}` }]] }
+                    );
+                },
+
+                onActionStart: async (action) => {
+                    const icon = { run: '▶️', write: '✏️', read: '📄', mkdir: '📁', cd: '📂', install: '📦', delete: '🗑', send_file: '📤', send_folder: '📦' }[action.type] || '⚙️';
+                    const label = action.type === 'run' ? action.command : (action.path || action.package || '');
+                    actionLog += `${icon} ${escapeHtml(label.slice(0, 60))}\n`;
+                    await edit(
+                        `🟡 <b>Running...</b>\n\n🎯 ${escapeHtml(planText.match(/GOAL:\s*(.+)/)?.[1] || '')}\n\n<b>Actions:</b>\n<pre>${actionLog.slice(-800)}</pre>`,
+                        { inline_keyboard: [[{ text: '🔴 Cancel', callback_data: `ide_cancel_${userId}` }]] }
+                    );
+                },
+
+                onActionDone: async (action, result) => {
+                    const icon = result.success ? '✅' : '❌';
+                    const label = action.type === 'run' ? action.command : (action.path || action.package || '');
+                    const outSnip = result.output.slice(-200).replace(/\n/g, ' ');
+                    actionLog = actionLog.replace(
+                        new RegExp(`[\u25b6✏📄📁📂📦🗑📤⚙] ${escapeHtml(label.slice(0, 60))}\n`),
+                        `${icon} ${escapeHtml(label.slice(0, 60))}\n`
+                    );
+                    if (!result.success) {
+                        actionLog += `   ⚠️ ${escapeHtml(outSnip.slice(0, 100))}\n`;
+                    }
+                },
+
+                onReview: async (review, outputs) => {
+                    const icon = review?.startsWith('PASS') ? '✅' : review?.startsWith('FAIL') ? '❌' : '🟡';
+                    await ctx.reply(
+                        `${icon} <b>Review:</b>\n<pre>${escapeHtml((review || '').slice(0, 500))}</pre>`,
+                        { parse_mode: 'HTML' }
+                    ).catch(() => {});
+                },
+
+                onDone: async (message, outputs) => {
+                    await edit(
+                        `🟢 <b>Done!</b>\n\n${escapeHtml(message)}\n\n<b>Actions taken:</b>\n<pre>${actionLog.slice(-1000)}</pre>`,
+                        {
+                            inline_keyboard: [
+                                [{ text: '🔄 Continue / Follow-up', callback_data: `ide_continue_${userId}` }],
+                                [{ text: '🗂 Change Directory', callback_data: `ide_cd_${userId}` }, { text: '🗑 End Session', callback_data: `ide_end_${userId}` }],
+                            ]
+                        }
+                    );
+                },
+
+                onNeedInput: async (question) => {
+                    ideSessions.get(userId).waitingInput = true;
+                    await ctx.reply(
+                        `❓ <b>IDE needs input:</b>\n${escapeHtml(question)}`,
+                        { parse_mode: 'HTML' }
+                    ).catch(() => {});
+                },
+
+                onSendFile: async (directive) => {
+                    const isFolder = directive.startsWith('SEND_FOLDER:');
+                    const filePath = directive.replace('SEND_FILE:', '').replace('SEND_FOLDER:', '').trim();
+                    try {
+                        if (isFolder) {
+                            const zipPath = `${filePath}.zip`;
+                            const { execSync } = require('child_process');
+                            execSync(`zip -r "${zipPath}" "${filePath}"`, { timeout: 30000 });
+                            await ctx.replyWithDocument({ source: zipPath, filename: path.basename(zipPath) }).catch(() => {});
+                            fsp.unlink(zipPath).catch(() => {});
+                        } else {
+                            await ctx.replyWithDocument({ source: filePath, filename: path.basename(filePath) }).catch(() => {});
+                        }
+                    } catch (e) {
+                        await ctx.reply(`❌ Could not send file: ${e.message}`).catch(() => {});
+                    }
+                },
+            });
+        } catch (e) {
+            await edit(`❌ <b>IDE Error:</b> ${escapeHtml(e.message)}`);
+        }
+    }
+
+    // /ide command
+    bot.command('ide', async (ctx) => {
+        const text = ctx.message?.text?.replace('/ide', '').trim();
+        if (!text) {
+            return ctx.reply(
+                '🧠 <b>IDE AI</b>\n\nSend your request after /ide:\n<code>/ide build a telegram bot in python</code>\n<code>/ide install and setup nginx</code>\n<code>/ide create a react app called myapp</code>',
+                { parse_mode: 'HTML' }
+            );
+        }
+        await runIdeForUser(ctx, text);
+    });
+
+    // IDE cancel
+    bot.action(/^ide_cancel_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery('🔴 Cancelled').catch(() => {});
+        const userId = ctx.match[1];
+        ideSessions.delete(userId);
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        await ctx.reply('🔴 IDE session cancelled.').catch(() => {});
+    });
+
+    // IDE continue
+    bot.action(/^ide_continue_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.ideFollowUp = ctx.match[1];
+        await ctx.reply('💬 What do you want to do next? (type your follow-up)', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    // IDE end session
+    bot.action(/^ide_end_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery('🗑 Session ended').catch(() => {});
+        const userId = ctx.match[1];
+        ideSessions.delete(userId);
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        await ctx.reply('🗑 IDE session ended. Use /ide to start a new one.').catch(() => {});
+    });
+
+    // IDE change directory
+    bot.action(/^ide_cd_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const userId = ctx.match[1];
+        ctx.session = ctx.session || {};
+        ctx.session.ideCd = userId;
+        await ctx.reply('📂 Send the directory path to switch to:').catch(() => {});
+    });
+
+    const launchTelegram = async (attempt = 0) => {
+        try {
+            await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+            await bot.launch({ dropPendingUpdates: true });
+            logger.system('Premium Telegram Dashboard is ONLINE.');
+                    // Register all WhatsApp commands in Telegram's / menu so users can discover them
+                    try {
+                        const tgCmds = [
+                            { command: 'start',    description: 'Open main dashboard' },
+                            { command: 'nodes',    description: 'Manage WhatsApp nodes' },
+                            { command: 'ghost',    description: 'Toggle ghost protocol (auto/on/off)' },
+                            { command: 'gclink',   description: 'Get invite link for a group JID' },
+                            { command: 'exitchat', description: 'Exit node Chat Mode' },
+                            // WhatsApp bridge commands
+                            { command: 'play',     description: '.play <song> — download and send music' },
+                            { command: 'img',      description: '.img <desc> — generate AI image' },
+                            { command: 'sticker',  description: 'Auto sticker from image/video + guide' },
+                            { command: 'autosticker', description: 'Toggle auto sticker on/off' },
+                            { command: 'cmdplain', description: 'Show plain text command list' },
+                            { command: 'owner',    description: '.owner — show owner contact info' },
+                            { command: 'sys',      description: '.sys — server stats' },
+                            { command: 'pappy',    description: '.pappy on/off — toggle AI chat mode' },
+                            { command: 'gprotect', description: 'Open Telegram group protection panel' },
+                            { command: 'kick',     description: 'Reply: kick member from group' },
+                            { command: 'warn',     description: 'Reply: warn member in group' },
+                            { command: 'ban',      description: 'Reply: ban member from group' },
+                            { command: 'mute',     description: 'Reply: mute member (/mute 30)' },
+                            { command: 'unmute',   description: 'Reply: unmute member' },
+                            { command: 'tagall',   description: 'Tag admin team in group' },
+                            { command: 'tts',      description: '.tts <text> — text to speech voice note' },
+                            { command: 'video',    description: '.video <search> — search and send video' },
+                            { command: 'tourl',    description: '.tourl — upload replied media to CDN' },
+                            { command: 'gstatus',  description: '.gstatus — post group status' },
+                            { command: 'ggstatus', description: '.ggstatus — post status to all groups' },
+                            { command: 'updategstatus', description: '.updategstatus <link> — update gc status' },
+                            { command: 'queues',   description: 'Show live queue shard debug' },
+                            { command: 'godcast',  description: '.godcast — send to all groups (ghost)' },
+                            { command: 'gcast',    description: '.gcast <msg> — broadcast to all groups' },
+                        ];
+                        await bot.telegram.setMyCommands(tgCmds);
+                        logger.info('[Telegram] Bot commands registered in menu.');
+                    } catch (cmdErr) {
+                        logger.warn(`[Telegram] setMyCommands failed: ${cmdErr.message}`);
+                    }
+        } catch (err) {
+            const msg = String(err?.message || err);
+            if (msg.includes('409') || msg.toLowerCase().includes('conflict')) {
+                const waitMs = Math.min(3000 * (attempt + 1), 15000);
+                logger.warn(`[Telegram] Polling conflict detected (attempt ${attempt + 1}). Retrying in ${waitMs}ms...`);
+                try { bot.stop('telegram-conflict-retry'); } catch {}
+                await new Promise((resolve) => setTimeout(resolve, waitMs));
+                return launchTelegram(attempt + 1);
+            }
+            logger.error(`[Telegram] Launch failed: ${msg}`);
+            throw err;
+        }
+    };
+
+    launchTelegram().catch((err) => {
+        logger.error(`[Telegram] Launcher loop aborted: ${String(err?.message || err)}`);
+    });
+
+    // ── MENU SONG: audio upload from owner studio ──
+    bot.on('audio', async (ctx, next) => {
+        const userId = String(ctx.from?.id || '');
+
+        if (ctx.session?.awaitingWelcomeMedia && isTelegramGroupChat(ctx)) {
+            const awaiting = ctx.session.awaitingWelcomeMedia;
+            if (awaiting?.chatId === String(ctx.chat.id) && awaiting?.type === 'audio') {
+                const audio = ctx.message?.audio;
+                if (audio?.file_id) {
+                    const cfg = getGroupProtectConfig(String(ctx.chat.id));
+                    cfg.welcome.media = { type: 'audio', fileId: audio.file_id };
+                    setGroupProtectConfig(String(ctx.chat.id), cfg);
+                    ctx.session.awaitingWelcomeMedia = null;
+                    return ctx.reply('✅ Welcome song saved for this group.', { parse_mode: 'HTML' }).catch(() => {});
+                }
+            }
+        }
+
+        // Music Finder: treat forwarded/sent audio as a song search query
+        if (isMusicDlEnabled(userId) && !ctx.session?.awaitingMenuSongUploadMode) {
+            const audio = ctx.message?.audio;
+            const query = String(audio?.title || audio?.file_name || audio?.performer || '').replace(/\.[a-z0-9]+$/i, '').trim();
+            const caption = String(ctx.message?.caption || '').trim();
+            const groupTrigger = /^(?:\/play|\.play)\s+(.+)/i.exec(caption)?.[1] || /^(?:pappy\s+play)\s+(.+)/i.exec(caption)?.[1] || '';
+            const finalQuery = isTelegramGroupChat(ctx) ? String(groupTrigger || '').trim() : query;
+            if (finalQuery) {
+                const statusMsg = await ctx.reply(`🎵 <b>Searching for:</b> <i>${escapeHtml(finalQuery)}</i>\n\n🔍 <i>Looking up top matches...</i>`, { parse_mode: 'HTML' }).catch(() => null);
+                try {
+                    const { results, hasMore } = await searchSongs(finalQuery, 0);
+                    if (!results.length) { await editStatus(ctx, statusMsg, `❌ No results found for <b>${escapeHtml(finalQuery)}</b>`); return next(); }
+                    await editStatus(ctx, statusMsg, `🎵 <b>Pick a song:</b>`);
+                    const searchToken = rememberMusicSearch(userId, finalQuery);
+                    const inline_keyboard = results.map((r, i) => [{
+                        text: `${i + 1}. ${r.title.slice(0, 38)} — ${r.uploader.slice(0, 18)} [${r.duration}]`,
+                        callback_data: `musicpick:${/\bvideo\b/i.test(finalQuery) ? 'v:' : ''}${r.videoId}`
+                    }]);
+                    if (hasMore) inline_keyboard.push([{ text: '➡️ Next', callback_data: `musicmore:${searchToken}:1` }]);
+                    await ctx.reply(`🎵 <b>Results for:</b> <i>${escapeHtml(finalQuery)}</i>\n\nTap the song you want — I’ll download it + fetch lyrics:`,
+                        { parse_mode: 'HTML', reply_markup: { inline_keyboard } }).catch((err) => {
+                        logger.warn('[MusicDL] Failed to send audio-result keyboard', { error: err?.message || String(err) });
+                    });
+                    if (statusMsg?.message_id) ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+                } catch (err) {
+                    logger.warn('[MusicDL] Audio search failed', { query: finalQuery, error: err.message });
+                    await editStatus(ctx, statusMsg, `❌ Search failed: <code>${escapeHtml(err.message)}</code>`);
+                }
+                return next();
+            }
+        }
+
+        const uploadMode = ctx.session?.awaitingMenuSongUploadMode;
+        if (!uploadMode) return next();
+
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!rbac.hasRolePermission(userRole, 'OWNER')) {
+            ctx.session.awaitingMenuSongUploadMode = null;
+            return ctx.reply('⚠️ Access denied. Owner only.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        try {
+            const audio = ctx.message?.audio;
+            if (!audio?.file_id) return ctx.reply('❌ No audio payload found.', { parse_mode: 'HTML' }).catch(() => {});
+
+            const buffer = await downloadTelegramFileBuffer(ctx, audio.file_id);
+            const nameFromCaption = String(ctx.message?.caption || '').trim();
+            const nameFromFile = String(audio?.file_name || '').replace(/\.[a-z0-9]+$/i, '').trim();
+            const finalName = nameFromCaption || nameFromFile || `Menu Song ${Date.now()}`;
+            const saved = menuSongManager.addSongFromBuffer({
+                buffer,
+                mimeType: audio.mime_type || 'audio/mpeg',
+                name: finalName,
+                addedBy: userId,
+                replaceActive: uploadMode === 'set',
+            });
+
+            if (uploadMode === 'add') menuSongManager.setActiveSong(saved.id);
+            ctx.session.awaitingMenuSongUploadMode = null;
+
+            const { text, reply_markup } = getMenuSongStudioView();
+            return ctx.reply(`✅ Saved menu song: <b>${escapeHtml(saved.name)}</b>\n\n${text}`, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+        } catch (e) {
+            ctx.session.awaitingMenuSongUploadMode = null;
+            return ctx.reply(`❌ Failed to save song: <code>${escapeHtml(e.message)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+        }
+    });
+
+    bot.on('voice', async (ctx, next) => {
+        const userId = String(ctx.from?.id || '');
+
+        // Music Finder: treat forwarded voice note as a song search — use caption trigger
+        if (isMusicDlEnabled(userId) && !ctx.session?.awaitingMenuSongUploadMode) {
+            const captionRaw = String(ctx.message?.caption || '').trim();
+            const groupTriggeredQuery = /^(?:\/play|\.play)\s+(.+)/i.exec(captionRaw)?.[1] || /^(?:pappy\s+play)\s+(.+)/i.exec(captionRaw)?.[1] || '';
+            const captionQuery = isTelegramGroupChat(ctx) ? String(groupTriggeredQuery || '').trim() : captionRaw;
+            if (isTelegramGroupChat(ctx) && !captionQuery) return next();
+            const statusMsg = await ctx.reply(
+                captionQuery
+                    ? `🎵 <b>Searching for:</b> <i>${escapeHtml(captionQuery)}</i>\n\n🔍 <i>Looking up top matches...</i>`
+                    : `🎵 <b>Voice note received</b>\n\n⚠️ I can’t identify songs from audio yet.\n⬇️ Add a caption with the <b>song name</b> to search for it.`,
+                { parse_mode: 'HTML' }
+            ).catch(() => null);
+            if (captionQuery) {
+                try {
+                    const { results, hasMore } = await searchSongs(captionQuery, 0);
+                    if (!results.length) { await editStatus(ctx, statusMsg, `❌ No results for <b>${escapeHtml(captionQuery)}</b>`); return next(); }
+                    await editStatus(ctx, statusMsg, `🎵 <b>Pick a song:</b>`);
+                    const searchToken = rememberMusicSearch(userId, captionQuery);
+                    const inline_keyboard = results.map((r, i) => [{
+                        text: `${i + 1}. ${r.title.slice(0, 38)} — ${r.uploader.slice(0, 18)} [${r.duration}]`,
+                        callback_data: `musicpick:${/\bvideo\b/i.test(captionQuery) ? 'v:' : ''}${r.videoId}`
+                    }]);
+                    if (hasMore) inline_keyboard.push([{ text: '➡️ Next', callback_data: `musicmore:${searchToken}:1` }]);
+                    await ctx.reply(`🎵 <b>Results for:</b> <i>${escapeHtml(captionQuery)}</i>\n\nTap the song you want — I’ll download it + fetch lyrics:`,
+                        { parse_mode: 'HTML', reply_markup: { inline_keyboard } }).catch((err) => {
+                        logger.warn('[MusicDL] Failed to send voice-result keyboard', { error: err?.message || String(err) });
+                    });
+                    if (statusMsg?.message_id) ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+                } catch (err) {
+                    logger.warn('[MusicDL] Voice search failed', { captionQuery, error: err.message });
+                    await editStatus(ctx, statusMsg, `❌ Search failed: <code>${escapeHtml(err.message)}</code>`);
+                }
+            }
+            return next();
+        }
+
+        const uploadMode = ctx.session?.awaitingMenuSongUploadMode;
+        if (!uploadMode) return next();
+
+        const userRole2 = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!rbac.hasRolePermission(userRole2, 'OWNER')) {
+            ctx.session.awaitingMenuSongUploadMode = null;
+            return ctx.reply('⚠️ Access denied. Owner only.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        try {
+            const voice = ctx.message?.voice;
+            if (!voice?.file_id) return ctx.reply('❌ No voice payload found.', { parse_mode: 'HTML' }).catch(() => {});
+
+            const buffer = await downloadTelegramFileBuffer(ctx, voice.file_id);
+            const nameFromCaption2 = String(ctx.message?.caption || '').trim();
+            const finalName = nameFromCaption2 || `Voice Menu Song ${Date.now()}`;
+            const saved = menuSongManager.addSongFromBuffer({
+                buffer,
+                mimeType: voice.mime_type || 'audio/ogg',
+                name: finalName,
+                addedBy: userId,
+                replaceActive: uploadMode === 'set',
+            });
+
+            if (uploadMode === 'add') menuSongManager.setActiveSong(saved.id);
+            ctx.session.awaitingMenuSongUploadMode = null;
+
+            const { text, reply_markup } = getMenuSongStudioView();
+            return ctx.reply(`✅ Saved menu song: <b>${escapeHtml(saved.name)}</b>\n\n${text}`, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+        } catch (e) {
+            ctx.session.awaitingMenuSongUploadMode = null;
+            return ctx.reply(`❌ Failed to save song: <code>${escapeHtml(e.message)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+        }
+    });
+
+    // ── WARMUP: photo sent while awaiting GC entry drop ──
+    bot.on('photo', async (ctx, next) => {
+        if (ctx.session?.awaitingWelcomeMedia && isTelegramGroupChat(ctx)) {
+            const awaiting = ctx.session.awaitingWelcomeMedia;
+            if (awaiting?.chatId === String(ctx.chat.id) && awaiting?.type === 'photo') {
+                const photo = ctx.message.photo?.[ctx.message.photo.length - 1];
+                if (photo?.file_id) {
+                    const cfg = getGroupProtectConfig(String(ctx.chat.id));
+                    cfg.welcome.media = { type: 'photo', fileId: photo.file_id };
+                    setGroupProtectConfig(String(ctx.chat.id), cfg);
+                    ctx.session.awaitingWelcomeMedia = null;
+                    return ctx.reply('✅ Welcome photo saved for this group.', { parse_mode: 'HTML' }).catch(() => {});
+                }
+            }
+        }
+
+        if (ctx.session?.supportCompose) {
+            const photo = ctx.message.photo?.[ctx.message.photo.length - 1];
+            if (!photo?.file_id) return ctx.reply('❌ No photo found.', { parse_mode: 'HTML' }).catch(() => {});
+            ctx.session.supportCompose = false;
+            ctx.session.supportDraft = {
+                text: '',
+                caption: String(ctx.message?.caption || ''),
+                mediaType: 'photo',
+                fileId: photo.file_id,
+                fileName: 'telegram-photo.jpg',
+                mimeType: 'image/jpeg',
+            };
+            const view = getSupportDraftView(ctx.session.supportDraft);
+            return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+        }
+        if (ctx.session?.state === 'AWAITING_WARMUP_CONTENT') return next();
+        const caption = String(ctx.message?.caption || '');
+        const explicitUrl = wantsUrlFromCaption(caption);
+        if (explicitUrl) {
+            try {
+                await sendTelegramMediaUrl(ctx, 'photo');
+            } catch (e) {
+                await ctx.reply(`❌ Auto URL failed: ${e.message}`);
+            }
+            return;
+        }
+
+        const autoStickerOn = getAutoStickerStateForUser(ctx.from?.id);
+        if (!autoStickerOn) return next();
+
+        try {
+            await autoStickerFromTelegramMedia(ctx, 'photo');
+        } catch (e) {
+            await ctx.reply(`❌ Sticker creation failed: ${e.message}`);
+        }
+        return;
+    });
+
+    bot.on('video', async (ctx, next) => {
+        if (ctx.session?.awaitingWelcomeMedia && isTelegramGroupChat(ctx)) {
+            const awaiting = ctx.session.awaitingWelcomeMedia;
+            if (awaiting?.chatId === String(ctx.chat.id) && awaiting?.type === 'video') {
+                const video = ctx.message?.video;
+                if (video?.file_id) {
+                    const cfg = getGroupProtectConfig(String(ctx.chat.id));
+                    cfg.welcome.media = { type: 'video', fileId: video.file_id };
+                    setGroupProtectConfig(String(ctx.chat.id), cfg);
+                    ctx.session.awaitingWelcomeMedia = null;
+                    return ctx.reply('✅ Welcome video saved for this group.', { parse_mode: 'HTML' }).catch(() => {});
+                }
+            }
+        }
+
+        if (ctx.session?.supportCompose) {
+            const video = ctx.message.video;
+            if (!video?.file_id) return ctx.reply('❌ No video found.', { parse_mode: 'HTML' }).catch(() => {});
+            ctx.session.supportCompose = false;
+            ctx.session.supportDraft = {
+                text: '',
+                caption: String(ctx.message?.caption || ''),
+                mediaType: 'video',
+                fileId: video.file_id,
+                fileName: video.file_name || 'telegram-video.mp4',
+                mimeType: video.mime_type || 'video/mp4',
+            };
+            const view = getSupportDraftView(ctx.session.supportDraft);
+            return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+        }
+        if (ctx.session?.state === 'AWAITING_WARMUP_CONTENT') return next();
+        const caption = String(ctx.message?.caption || '');
+        const explicitUrl = wantsUrlFromCaption(caption);
+        if (explicitUrl) {
+            try {
+                await sendTelegramMediaUrl(ctx, 'video');
+            } catch (e) {
+                await ctx.reply(`❌ Auto URL failed: ${e.message}`);
+            }
+            return;
+        }
+
+        const autoStickerOn = getAutoStickerStateForUser(ctx.from?.id);
+        if (!autoStickerOn) return next();
+
+        try {
+            await autoStickerFromTelegramMedia(ctx, 'video');
+        } catch (e) {
+            await ctx.reply(`❌ Sticker creation failed: ${e.message}`);
+        }
+        return;
+    });
+
+    bot.on('photo', async (ctx) => {
+        if (ctx.session?.state !== 'AWAITING_WARMUP_CONTENT') {
+            const auto = getAutoUrlStateForUser(ctx.from?.id);
+            if (!auto?.enabled) return;
+
+            try {
+                const fileId = ctx.message.photo?.[ctx.message.photo.length - 1]?.file_id;
+                if (!fileId) return;
+                const url = await uploadTelegramFileToUrl(ctx, fileId, 'telegram-image.jpg', 'image/jpeg');
+                await ctx.reply(`🔗 <b>Image URL</b>\n<code>${url}</code>`, { parse_mode: 'HTML' });
+            } catch (e) {
+                await ctx.reply(`❌ Auto URL failed: ${e.message}`);
+            }
+            return;
+        }
+        const sessionKey = ctx.session.warmupNode;
+        ctx.session.state = 'IDLE';
+        ctx.session.warmupNode = null;
+        const phone = sessionKey?.split('_')[1] || sessionKey;
+        try {
+            const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
+            const fileUrl = await ctx.telegram.getFileLink(fileId);
+            const res = await require('axios').get(fileUrl.href, { responseType: 'arraybuffer' });
+            const mediaPath = require('path').join(__dirname, `../data/warmup-media-${phone}.jpg`);
+            require('fs').writeFileSync(mediaPath, Buffer.from(res.data));
+            const caption = ctx.message.caption || '';
+            const cfgPath = require('path').join(__dirname, `../data/warmup-config-${phone}.json`);
+            const cfg = require('fs').existsSync(cfgPath) ? JSON.parse(require('fs').readFileSync(cfgPath, 'utf8')) : {};
+            cfg.statusPayload = caption; cfg.mediaType = 'image';
+            require('fs').writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+            const confirmMsg = await ctx.reply(`✅ <b>Saved!</b> Image entry drop set for +${phone}.`, { parse_mode: 'HTML' });
+            setTimeout(async () => {
+                await ctx.telegram.deleteMessage(ctx.chat.id, confirmMsg.message_id).catch(() => {});
+                const sock = activeSockets.get(sessionKey);
+                const isOnline = sock?.user ? 'Online 🟢' : 'Offline ⏳';
+                const panel = getNodeControlView(sessionKey, String(ctx.from?.id || ''));
+                ctx.reply(panel.text, { parse_mode: 'HTML', reply_markup: panel.reply_markup }).catch(() => {});
+            }, 1500);
+        } catch (e) { ctx.reply(`❌ Failed: ${e.message}`); }
+    });
+
+    // ── WARMUP: video sent while awaiting GC entry drop ──
+    bot.on('video', async (ctx) => {
+        if (ctx.session?.state !== 'AWAITING_WARMUP_CONTENT') {
+            const auto = getAutoUrlStateForUser(ctx.from?.id);
+            if (!auto?.enabled) return;
+
+            try {
+                const fileId = ctx.message.video?.file_id;
+                if (!fileId) return;
+                const url = await uploadTelegramFileToUrl(ctx, fileId, 'telegram-video.mp4', 'video/mp4');
+                await ctx.reply(`🔗 <b>Video URL</b>\n<code>${url}</code>`, { parse_mode: 'HTML' });
+            } catch (e) {
+                await ctx.reply(`❌ Auto URL failed: ${e.message}`);
+            }
+            return;
+        }
+        const sessionKey = ctx.session.warmupNode;
+        ctx.session.state = 'IDLE';
+        ctx.session.warmupNode = null;
+        const phone = sessionKey?.split('_')[1] || sessionKey;
+        try {
+            const fileId = ctx.message.video.file_id;
+            const fileUrl = await ctx.telegram.getFileLink(fileId);
+            const res = await require('axios').get(fileUrl.href, { responseType: 'arraybuffer' });
+            const mediaPath = require('path').join(__dirname, `../data/warmup-media-${phone}.mp4`);
+            require('fs').writeFileSync(mediaPath, Buffer.from(res.data));
+            const caption = ctx.message.caption || '';
+            const cfgPath = require('path').join(__dirname, `../data/warmup-config-${phone}.json`);
+            const cfg = require('fs').existsSync(cfgPath) ? JSON.parse(require('fs').readFileSync(cfgPath, 'utf8')) : {};
+            cfg.statusPayload = caption; cfg.mediaType = 'video';
+            require('fs').writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+            const confirmMsg = await ctx.reply(`✅ <b>Saved!</b> Video entry drop set for +${phone}.`, { parse_mode: 'HTML' });
+            setTimeout(async () => {
+                await ctx.telegram.deleteMessage(ctx.chat.id, confirmMsg.message_id).catch(() => {});
+                const sock = activeSockets.get(sessionKey);
+                const isOnline = sock?.user ? 'Online 🟢' : 'Offline ⏳';
+                const panel = getNodeControlView(sessionKey, String(ctx.from?.id || ''));
+                ctx.reply(panel.text, { parse_mode: 'HTML', reply_markup: panel.reply_markup }).catch(() => {});
+            }, 1500);
+        } catch (e) { ctx.reply(`❌ Failed: ${e.message}`); }
+    });
+
+    // ── AUTO URL: document to URL when enabled ──────────────────────────────
+    bot.on('document', async (ctx) => {
+        if (ctx.session?.awaitingWelcomeMedia && isTelegramGroupChat(ctx)) {
+            const awaiting = ctx.session.awaitingWelcomeMedia;
+            const doc = ctx.message?.document;
+            const mimeType = String(doc?.mime_type || '').toLowerCase();
+            if (awaiting?.chatId === String(ctx.chat.id) && awaiting?.type === 'audio' && doc?.file_id && mimeType.startsWith('audio/')) {
+                const cfg = getGroupProtectConfig(String(ctx.chat.id));
+                cfg.welcome.media = { type: 'audio', fileId: doc.file_id };
+                setGroupProtectConfig(String(ctx.chat.id), cfg);
+                ctx.session.awaitingWelcomeMedia = null;
+                return ctx.reply('✅ Welcome song saved from audio file.', { parse_mode: 'HTML' }).catch(() => {});
+            }
+        }
+
+        const uploadMode = ctx.session?.awaitingMenuSongUploadMode;
+        if (uploadMode) {
+            const userId = String(ctx.from?.id || '');
+            const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+            if (!rbac.hasRolePermission(userRole, 'OWNER')) {
+                ctx.session.awaitingMenuSongUploadMode = null;
+                return ctx.reply('⚠️ Access denied. Owner only.', { parse_mode: 'HTML' }).catch(() => {});
+            }
+
+            const doc = ctx.message?.document;
+            const mimeType = String(doc?.mime_type || '').toLowerCase();
+            if (!doc?.file_id || !mimeType.startsWith('audio/')) {
+                return ctx.reply('❌ Send an audio document (mp3/m4a/ogg/wav) while setting menu song.', { parse_mode: 'HTML' }).catch(() => {});
+            }
+
+            try {
+                const buffer = await downloadTelegramFileBuffer(ctx, doc.file_id);
+                const nameFromCaption = String(ctx.message?.caption || '').trim();
+                const nameFromFile = String(doc.file_name || '').replace(/\.[a-z0-9]+$/i, '').trim();
+                const finalName = nameFromCaption || nameFromFile || `Menu Song ${Date.now()}`;
+                const saved = menuSongManager.addSongFromBuffer({
+                    buffer,
+                    mimeType: doc.mime_type || 'audio/mpeg',
+                    name: finalName,
+                    addedBy: userId,
+                    replaceActive: uploadMode === 'set',
+                });
+
+                if (uploadMode === 'add') menuSongManager.setActiveSong(saved.id);
+                ctx.session.awaitingMenuSongUploadMode = null;
+                const { text, reply_markup } = getMenuSongStudioView();
+                return ctx.reply(`✅ Saved menu song: <b>${escapeHtml(saved.name)}</b>\n\n${text}`, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+            } catch (e) {
+                ctx.session.awaitingMenuSongUploadMode = null;
+                return ctx.reply(`❌ Failed to save song: <code>${escapeHtml(e.message)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+            }
+        }
+
+        if (ctx.session?.supportCompose) {
+            const doc = ctx.message.document;
+            if (!doc?.file_id) return ctx.reply('❌ No file found.', { parse_mode: 'HTML' }).catch(() => {});
+            ctx.session.supportCompose = false;
+            ctx.session.supportDraft = {
+                text: '',
+                caption: String(ctx.message?.caption || ''),
+                mediaType: 'document',
+                fileId: doc.file_id,
+                fileName: doc.file_name || 'telegram-file',
+                mimeType: doc.mime_type || 'application/octet-stream',
+            };
+            const view = getSupportDraftView(ctx.session.supportDraft);
+            return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+        }
+        const auto = getAutoUrlStateForUser(ctx.from?.id);
+        if (!auto?.enabled) return;
+        if (ctx.session?.state === 'AWAITING_WARMUP_CONTENT') return;
+
+        try {
+            const doc = ctx.message.document;
+            if (!doc?.file_id) return;
+            const safeName = doc.file_name || 'telegram-file.bin';
+            const mimeType = doc.mime_type || 'application/octet-stream';
+            const url = await uploadTelegramFileToUrl(ctx, doc.file_id, safeName, mimeType);
+            await ctx.reply(`🔗 <b>File URL</b>\n<code>${url}</code>`, { parse_mode: 'HTML' });
+        } catch (e) {
+            await ctx.reply(`❌ Auto URL failed: ${e.message}`);
+        }
+    });
+
+    process.once('SIGINT', () => bot.stop('SIGINT'));
+    process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+    return bot;
+}
+
+module.exports = { startTelegram, getMainDashboardMenu };
