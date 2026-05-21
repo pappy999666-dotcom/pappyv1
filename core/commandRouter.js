@@ -269,6 +269,14 @@ class CommandRouter {
                         this._running.set(runKey, activeCount + 1);
                     }
 
+                    eventBus.emit('command.trace', {
+                        botId,
+                        commandName,
+                        sender,
+                        remoteJid: msg?.key?.remoteJid,
+                        status: 'start',
+                    });
+
                     // Per-command timeout: media/broadcast gets longer windows.
                     const timeoutMs = this.getCommandTimeoutMs(commandName);
                     const timeoutPromise = new Promise((_, reject) =>
@@ -276,8 +284,25 @@ class CommandRouter {
                     );
 
                     Promise.race([runCommand(undefined), timeoutPromise])
+                        .then(() => {
+                            eventBus.emit('command.trace', {
+                                botId,
+                                commandName,
+                                sender,
+                                remoteJid: msg?.key?.remoteJid,
+                                status: 'success',
+                            });
+                        })
                         .catch(err => {
                             logger.error(`[CRASH PREVENTED][${isInstant ? 'INSTANT' : 'QUEUED'}] Error in ${commandName}: ${err.message}`);
+                            eventBus.emit('command.trace', {
+                                botId,
+                                commandName,
+                                sender,
+                                remoteJid: msg?.key?.remoteJid,
+                                status: 'error',
+                                error: err?.message || String(err),
+                            });
                             sendPremiumText(sock, msg.key.remoteJid, `❌ ${commandName} failed. Please retry.`).catch(() => {});
                         })
                         .finally(() => {

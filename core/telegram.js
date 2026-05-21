@@ -22,6 +22,7 @@ const ownerManager = require('../modules/ownerManager');
 const pairingRegistry = require('../modules/pairingRegistry');
 const { startWhatsApp, activeSockets, botState, saveState } = require('./whatsapp');
 const logger      = require('./logger');
+const eventBus = require('./eventBus');
 const taskManager = require('./taskManager');
 const Intel       = require('./models/Intel');
 const { isRadarEnabled, setRadarEnabled } = require('./radarControl');
@@ -73,7 +74,106 @@ const TG_INTEL_RATE_PAUSE_MS = Math.max(60000, Number(process.env.TG_INTEL_RATE_
 const TG_INTEL_PREVALIDATE_LINKS = String(process.env.TG_INTEL_PREVALIDATE_LINKS || '1') !== '0';
 const TG_INTEL_VALIDATE_TIMEOUT_MS = Math.max(2000, Number(process.env.TG_INTEL_VALIDATE_TIMEOUT_MS || 4500));
 const TG_INTEL_VALIDATE_DELAY_MS = Math.max(0, Number(process.env.TG_INTEL_VALIDATE_DELAY_MS || 150));
-const TG_INTEL_VALIDATE_MAX_PER_RUN = Math.max(0, Number(process.env.TG_INTEL_VALIDATE_MAX_PER_RUN || 20));
+const TG_INTEL_VALIDATE_MAX_PER_RUN = Math.max(0, Number(process.env.TG_INTEL_VALIDATE_MAX_PER_RUN || 100));
+const TG_LIVE_LOG_RECENT_LIMIT = 120;
+const TG_LIVE_LOG_FLUSH_MS = 1800;
+const TG_LIVE_LOG_MAX_LINES_PER_FLUSH = 12;
+
+function getTgLiveLogStore() {
+    if (!global._tgLiveLogStore) {
+        global._tgLiveLogStore = {
+            prefs: new Map(),
+            recentNode: new Map(),
+            recentAll: [],
+            flushers: new Map(),
+        };
+    }
+    return global._tgLiveLogStore;
+}
+
+function getTgLiveLogPref(chatId) {
+    const store = getTgLiveLogStore();
+    const key = String(chatId || '');
+    if (!store.prefs.has(key)) store.prefs.set(key, { all: false, nodes: new Set() });
+    const pref = store.prefs.get(key);
+    if (!(pref.nodes instanceof Set)) pref.nodes = new Set(Array.isArray(pref.nodes) ? pref.nodes : []);
+    return pref;
+}
+
+function recordTgLiveLog(sessionKey, line) {
+    const store = getTgLiveLogStore();
+    const stamped = `[${new Date().toISOString().slice(11, 19)}] ${String(line || '')}`;
+
+    if (sessionKey) {
+        const arr = store.recentNode.get(sessionKey) || [];
+        arr.unshift(stamped);
+        if (arr.length > TG_LIVE_LOG_RECENT_LIMIT) arr.length = TG_LIVE_LOG_RECENT_LIMIT;
+        store.recentNode.set(sessionKey, arr);
+    }
+
+    store.recentAll.unshift(stamped);
+    if (store.recentAll.length > TG_LIVE_LOG_RECENT_LIMIT) store.recentAll.length = TG_LIVE_LOG_RECENT_LIMIT;
+}
+
+function resolveSessionKeyByBotId(botId) {
+    const normalized = String(botId || '').replace(/[^0-9]/g, '');
+    if (!normalized) return null;
+    for (const [sessionKey] of activeSockets.entries()) {
+        const parts = String(sessionKey || '').split('_');
+        if (String(parts[0] || '').replace(/[^0-9]/g, '') === normalized) return sessionKey;
+    }
+    return null;
+}
+
+function queueTgLiveLog(chatId, line) {
+    const store = getTgLiveLogStore();
+    const key = String(chatId || '');
+    if (!key) return;
+
+    let state = store.flushers.get(key);
+    if (!state) {
+        state = { lines: [], timer: null };
+        store.flushers.set(key, state);
+    }
+
+    state.lines.push(String(line || '').slice(0, 320));
+    if (state.lines.length > TG_LIVE_LOG_MAX_LINES_PER_FLUSH) {
+        state.lines = state.lines.slice(-TG_LIVE_LOG_MAX_LINES_PER_FLUSH);
+    }
+    if (state.timer) return;
+
+    state.timer = setTimeout(async () => {
+        const payload = store.flushers.get(key);
+        if (!payload) return;
+        const lines = payload.lines.splice(0, payload.lines.length);
+        payload.timer = null;
+        if (!lines.length) return;
+        await global.tgBot?.telegram?.sendMessage(
+            Number(chatId),
+            `📡 <b>LIVE LOG</b>\n\n<code>${escapeHtml(lines.join('\n'))}</code>`,
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+    }, TG_LIVE_LOG_FLUSH_MS);
+}
+
+function pushTelegramLiveLog({ sessionKey = null, botId = null, source = 'SYSTEM', line = '' } = {}) {
+    const store = getTgLiveLogStore();
+    const resolvedSessionKey = sessionKey || resolveSessionKeyByBotId(botId) || null;
+    const phone = resolvedSessionKey ? (resolvedSessionKey.split('_')[1] || resolvedSessionKey) : (String(botId || '').replace(/[^0-9]/g, '') || 'n/a');
+    const cleanLine = String(line || '').trim();
+    if (!cleanLine) return;
+
+    const payloadLine = `📱+${phone} • ${String(source || 'SYSTEM').toUpperCase()} • ${cleanLine}`;
+    recordTgLiveLog(resolvedSessionKey, payloadLine);
+
+    for (const [chatId, pref] of store.prefs.entries()) {
+        const wantsNode = resolvedSessionKey ? pref.nodes?.has(resolvedSessionKey) : false;
+        if (!pref.all && !wantsNode) continue;
+        queueTgLiveLog(chatId, payloadLine);
+    }
+}
+
+global._pushTelegramLiveLog = pushTelegramLiveLog;
 
 function getForwardedLinkQueue() {
     if (!global._tgForwardedLinkQueue) {
@@ -202,6 +302,12 @@ function isIntelDeadLinkError(message) {
         m.includes('invite link is invalid') ||
         m.includes('invalid invite') ||
         m.includes('invalid group invite') ||
+        m.includes('invite code invalid') ||
+        m.includes('group does not exist') ||
+        m.includes('group not found') ||
+        m.includes('group invite revoked') ||
+        m.includes('invite no longer valid') ||
+        (m.includes('chat.whatsapp.com/') && m.includes('invalid')) ||
         m.includes('expired') ||
         m.includes('invite') && m.includes('not') && m.includes('valid')
     );
@@ -2350,6 +2456,11 @@ async function startTelegram() {
         { match: /^restart_node_/, role: 'USER' },
         { match: /^purge_node_/, role: 'OWNER' },
         { match: /^bcast_node_/, role: 'USER' },
+        { match: /^live_log_menu_/, role: 'USER' },
+        { match: /^live_log_toggle_node_/, role: 'USER' },
+        { match: /^live_log_show_node_/, role: 'USER' },
+        { match: 'live_log_toggle_all', role: 'USER' },
+        { match: 'live_log_show_all', role: 'USER' },
         { match: /^urltools_node_/, role: 'USER' },
         { match: /^urltools_toggle_/, role: 'USER' },
         { match: /^node_ai_prompt_/, role: 'USER' },
@@ -3651,6 +3762,7 @@ async function startTelegram() {
                 [ { text: `🧬 AI Vibe: ${getAiVibeLabel(getAiVibeForNode(userId, sessionKey))}`, callback_data: `node_vibe_toggle_${sessionKey}`, style: 'primary' } ],
                 [ { text: '🔗 Join Intel GCs', callback_data: `intel_menu_${sessionKey}`, style: 'success' } ],
                 [ { text: '📤 Send All Intel Links', callback_data: `intel_send_${sessionKey}` } ],
+                [ { text: '📡 Live Log', callback_data: `live_log_menu_${sessionKey}`, style: 'primary' } ],
                 [ { text: '💬 Chat Mode (send cmds to this node)', callback_data: `chat_node_${sessionKey}`, style: 'success' } ],
                 [ { text: '🔙 Back to Nodes', callback_data: 'menu_nodes', style: 'primary' } ]
             ]
@@ -4432,8 +4544,106 @@ async function startTelegram() {
         if (!resolveTelegramNodeScope(userId, userRole, ctx.match[1])) {
             return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
         }
-        const text = `📡 <b>BROADCAST TOOLS</b>\n\nYou can use the Universal Bridge to control this node by typing commands directly in Telegram:\n\n• <b>Godcast:</b> <code>.godcast Your Message</code>\n• <b>Standard Gcast:</b> <code>.gcast Your Message</code>\n• <b>Schedule:</b> <code>.schedulecast 15m Message</code>`;
-        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${ctx.match[1]}` }]] } }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+        const sessionKey = ctx.match[1];
+        const text = `📡 <b>BROADCAST TOOLS</b>\n\nYou can use the Universal Bridge to control this node by typing commands directly in Telegram:\n\n• <b>Godcast:</b> <code>.godcast Your Message</code>\n• <b>Standard Gcast:</b> <code>.gcast Your Message</code>\n• <b>Schedule:</b> <code>.schedulecast 15m Message</code>\n\nTip: open Live Log to watch per-node progress and command responses.`;
+        ctx.editMessageText(text, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '📡 Open Live Log', callback_data: `live_log_menu_${sessionKey}` }],
+                    [{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }],
+                ]
+            }
+        }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
+    });
+
+    bot.action(/^live_log_menu_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        const pref = getTgLiveLogPref(ctx.chat?.id);
+        const nodeOn = pref.nodes.has(sessionKey);
+        const allOn = !!pref.all;
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        const text = [
+            '📡 <b>LIVE LOG CONTROL</b>',
+            `📱 Node: +${phone}`,
+            '',
+            `Node stream: <b>${nodeOn ? 'ON' : 'OFF'}</b>`,
+            `All-commands stream: <b>${allOn ? 'ON' : 'OFF'}</b>`,
+            '',
+            '<i>Enable Node stream for focused logs, or All for every command and campaign update.</i>'
+        ].join('\n');
+
+        return ctx.editMessageText(text, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text: `${nodeOn ? '🔴 Disable' : '🟢 Enable'} Node Stream`, callback_data: `live_log_toggle_node_${sessionKey}` },
+                        { text: '🧾 Show Node Recent', callback_data: `live_log_show_node_${sessionKey}` },
+                    ],
+                    [
+                        { text: `${allOn ? '🔴 Disable' : '🟢 Enable'} All Commands`, callback_data: 'live_log_toggle_all' },
+                        { text: '🧾 Show Global Recent', callback_data: 'live_log_show_all' },
+                    ],
+                    [{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }],
+                ]
+            }
+        }).catch(() => {});
+    });
+
+    bot.action(/^live_log_toggle_node_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        const pref = getTgLiveLogPref(ctx.chat?.id);
+        if (pref.nodes.has(sessionKey)) pref.nodes.delete(sessionKey);
+        else pref.nodes.add(sessionKey);
+
+        const nodeOn = pref.nodes.has(sessionKey);
+        return ctx.reply(`📡 Node live stream is now <b>${nodeOn ? 'ON' : 'OFF'}</b> for this chat.`, { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action('live_log_toggle_all', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const pref = getTgLiveLogPref(ctx.chat?.id);
+        pref.all = !pref.all;
+        return ctx.reply(`📡 All-commands live log is now <b>${pref.all ? 'ON' : 'OFF'}</b>.`, { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action(/^live_log_show_node_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        const store = getTgLiveLogStore();
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        const lines = (store.recentNode.get(sessionKey) || []).slice(0, 25);
+        const body = lines.length ? lines.join('\n') : 'No recent node logs.';
+        return ctx.reply(`📱 <b>NODE LIVE LOG (+${phone})</b>\n\n<code>${escapeHtml(body)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action('live_log_show_all', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const store = getTgLiveLogStore();
+        const lines = (store.recentAll || []).slice(0, 35);
+        const body = lines.length ? lines.join('\n') : 'No recent logs.';
+        return ctx.reply(`📡 <b>GLOBAL LIVE LOG</b>\n\n<code>${escapeHtml(body)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
     });
 
     bot.action(/^urltools_node_(.+)$/, (ctx) => {
@@ -6639,6 +6849,13 @@ Returns the group's public invite link if available.`;
         }
 
         const botId = firstActiveSocket.user.id.split(':')[0];
+        const activeSessionKey = scoped?.sessionKey || resolveSessionKeyByBotId(botId) || null;
+        pushTelegramLiveLog({
+            sessionKey: activeSessionKey,
+            botId,
+            source: 'TG-BRIDGE',
+            line: `Command started: ${commandName} by ${ctx.from?.username ? '@' + ctx.from.username : (ctx.from?.first_name || 'telegram-user')}`,
+        });
         const botJid = `${botId}@s.whatsapp.net`;
         const mockMsg = {
             key: { remoteJid: botJid, fromMe: false, id: `TG_CMD_${Date.now()}` },
@@ -6666,9 +6883,11 @@ Returns the group's public invite link if available.`;
             };
             taskManager.submit(makeTelegramTaskId('TG_EXEC', userId, scoped?.sessionKey), async (abortSignal) => {
                 await targetPlugin.execute({ sock: firstActiveSocket, msg: broadcastMsg, args: text.trim().split(/ +/).slice(1), text, user: mockUserProfile, botId, abortSignal });
+                pushTelegramLiveLog({ sessionKey: activeSessionKey, botId, source: 'BROADCAST', line: `${commandName} queued successfully.` });
             }, { priority: 5, timeout: 600000 }).catch(err => {
                 ctx.reply(`❌ <b>Plugin Error:</b> ${err.message}`, { parse_mode: 'HTML' });
                 global._tgBroadcastCtx = null;
+                pushTelegramLiveLog({ sessionKey: activeSessionKey, botId, source: 'BROADCAST', line: `${commandName} failed to start: ${String(err.message || '').slice(0, 120)}` });
             });
             return;
         }
@@ -6694,6 +6913,7 @@ Returns the group's public invite link if available.`;
                                 return ctx.replyWithVideo({ source: Buffer.isBuffer(payload.video) ? payload.video : Buffer.from(payload.video) }, { caption });
                             } else if (payload.text) {
                                 const t = payload.text;
+                                pushTelegramLiveLog({ sessionKey: activeSessionKey, botId, source: 'NODE', line: t.replace(/\s+/g, ' ').slice(0, 220) });
                                 // Suppress heavy broadcast progress spam but allow useful feedback through
                                 const isNoise =
                                     t.includes('ENGINE ENGAGED') || t.includes('GODCAST') ||
@@ -6714,19 +6934,26 @@ Returns the group's public invite link if available.`;
 
         const runBridgeCommand = async (abortSignal) => {
             await targetPlugin.execute({ sock: bridgeSock, msg: mockMsg, args, text, user: mockUserProfile, botId, abortSignal });
+            pushTelegramLiveLog({ sessionKey: activeSessionKey, botId, source: 'TG-BRIDGE', line: `Command finished: ${commandName}` });
         };
 
         // Split-path dispatch: lightweight/user-facing commands execute instantly.
         const isInstant = TG_INSTANT_DOT_COMMANDS.has(commandName);
         const mustQueue = TG_HEAVY_QUEUED_DOT_COMMANDS.has(commandName);
         if (isInstant && !mustQueue) {
-            return runBridgeCommand(undefined).catch(err => ctx.reply(`❌ <b>Plugin Error:</b> ${err.message}`, { parse_mode: 'HTML' }));
+            return runBridgeCommand(undefined).catch(err => {
+                pushTelegramLiveLog({ sessionKey: activeSessionKey, botId, source: 'TG-BRIDGE', line: `Command failed: ${commandName} • ${String(err.message || '').slice(0, 120)}` });
+                return ctx.reply(`❌ <b>Plugin Error:</b> ${err.message}`, { parse_mode: 'HTML' });
+            });
         }
 
         // Default queued path for non-instant or heavy commands
         taskManager.submit(makeTelegramTaskId('TG_EXEC', userId, scoped?.sessionKey), async (abortSignal) => {
             await runBridgeCommand(abortSignal);
-        }, { priority: 5, timeout: 60000 }).catch(err => ctx.reply(`❌ <b>Plugin Error:</b> ${err.message}`, { parse_mode: 'HTML' }));
+        }, { priority: 5, timeout: 60000 }).catch(err => {
+            pushTelegramLiveLog({ sessionKey: activeSessionKey, botId, source: 'TG-BRIDGE', line: `Command failed: ${commandName} • ${String(err.message || '').slice(0, 120)}` });
+            return ctx.reply(`❌ <b>Plugin Error:</b> ${err.message}`, { parse_mode: 'HTML' });
+        });
     });
 
     bot.command('sticker', async (ctx) => {
@@ -6735,6 +6962,26 @@ Returns the group's public invite link if available.`;
             { parse_mode: 'HTML' }
         );
     });
+
+    if (!global._tgLiveLogEventBound) {
+        global._tgLiveLogEventBound = true;
+        eventBus.on('command.trace', (trace) => {
+            try {
+                if (!trace || typeof trace !== 'object') return;
+                const cmd = String(trace.commandName || '').trim();
+                if (!cmd) return;
+                const status = String(trace.status || 'info').toUpperCase();
+                const sender = String(trace.sender || '').split('@')[0] || 'unknown';
+                const extra = trace.error ? ` • ${String(trace.error).slice(0, 120)}` : '';
+                pushTelegramLiveLog({
+                    sessionKey: trace.sessionKey || resolveSessionKeyByBotId(trace.botId),
+                    botId: trace.botId,
+                    source: 'WHATSAPP',
+                    line: `${status} ${cmd} by ${sender}${extra}`,
+                });
+            } catch {}
+        });
+    }
 
     // ==========================================
     // 🎴 STICKER PACK MANAGEMENT

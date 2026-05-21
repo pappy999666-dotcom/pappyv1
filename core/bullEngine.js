@@ -146,6 +146,13 @@ function registerCampaign(meta = {}) {
     return campaignId;
 }
 
+function emitTelegramLiveLog(botId, source, line) {
+    try {
+        if (typeof global._pushTelegramLiveLog !== 'function') return;
+        global._pushTelegramLiveLog({ botId, source, line });
+    } catch {}
+}
+
 async function notifyCampaignDone(campaign) {
     if (!campaign || campaign.done) return;
     campaign.done = true;
@@ -194,6 +201,7 @@ async function notifyCampaignDone(campaign) {
     ].join('\n');
 
     await sock.sendMessage(campaign.chat, { text }).catch(() => {});
+    emitTelegramLiveLog(campaign.botId, 'BROADCAST', `Campaign done (${campaign.mode}): total=${campaign.total}, ok=${campaign.success}, failed=${campaign.failed}`);
     campaignTrackers.delete(campaign.campaignId);
 }
 
@@ -206,10 +214,12 @@ async function settleCampaignFromJob(job, isSuccess) {
 
     if (isSuccess) {
         campaign.success += 1;
+        emitTelegramLiveLog(campaign.botId, 'BROADCAST', `Progress ${campaign.mode}: ${campaign.success + campaign.failed}/${campaign.total} • ✅ ${String(job?.data?.targetJid || '').split('@')[0]}`);
     } else {
         campaign.failed += 1;
         const target = String(job?.data?.targetJid || '').trim();
         if (target) campaign.failedTargets.add(target);
+        emitTelegramLiveLog(campaign.botId, 'BROADCAST', `Progress ${campaign.mode}: ${campaign.success + campaign.failed}/${campaign.total} • ❌ ${target || 'unknown'}`);
     }
 
     const processed = campaign.success + campaign.failed;
