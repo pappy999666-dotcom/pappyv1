@@ -7,7 +7,16 @@ const userEngine = require('../modules/userEngine');
 const ownerManager = require('../modules/ownerManager');
 const logger = require('./logger');
 const softWork = require('./softWork');
+const runtimeFlags = require('./runtimeFlags');
+const { enqueueHeavyCommand } = require('./commandScheduler');
+const { sendPremiumText } = require('./responseEngine');
 const { globalPrefix, ownerWhatsAppJids } = require('../config');
+
+const HEAVY_COMMANDS = new Set([
+    '.godcast', '.gcast', '.ggstatus', '.setnewgcstatus',
+    '.updategstatus', '.schedulecast', '.schedulegodcast',
+    '.loopcast', '.loopgodcast'
+]);
 
 class CommandRouter {
     constructor() {
@@ -269,7 +278,7 @@ class CommandRouter {
                     Promise.race([runCommand(undefined), timeoutPromise])
                         .catch(err => {
                             logger.error(`[CRASH PREVENTED][${isInstant ? 'INSTANT' : 'QUEUED'}] Error in ${commandName}: ${err.message}`);
-                            sock.sendMessage(msg.key.remoteJid, { text: `❌ ${commandName} failed. Please retry.` }).catch(() => {});
+                            sendPremiumText(sock, msg.key.remoteJid, `❌ ${commandName} failed. Please retry.`).catch(() => {});
                         })
                         .finally(() => {
                             if (!isInstant) {
@@ -284,8 +293,20 @@ class CommandRouter {
                 if (isInstant) {
                     executeWithTimeout();
                 } else {
-                    // Other commands use setImmediate for non-blocking scheduling
-                    setImmediate(executeWithTimeout);
+                    // Heavy broadcast/status commands are queue-scheduled per node to protect responsiveness.
+                    if (runtimeFlags.heavyCommandScheduler !== false && HEAVY_COMMANDS.has(commandName)) {
+                        const scheduled = enqueueHeavyCommand({
+                            botId,
+                            commandName,
+                            run: executeWithTimeout,
+                        });
+                        if (!scheduled.enqueued) {
+                            sendPremiumText(sock, msg.key.remoteJid, `⏳ ${commandName} queue is full. Please retry shortly.`).catch(() => {});
+                        }
+                    } else {
+                        // Other commands use setImmediate for non-blocking scheduling
+                        setImmediate(executeWithTimeout);
+                    }
                 }
 
             } catch (error) {

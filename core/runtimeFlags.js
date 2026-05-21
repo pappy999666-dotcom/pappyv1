@@ -18,4 +18,6 @@ module.exports = {
     preserveLinkMetadata: envFlag('PRESERVE_LINK_METADATA', true),
     // Prevent accidental/spammy group metadata mutations.
     groupMetadataGuard: envFlag('GROUP_METADATA_GUARD', true),
+    // Queue heavy broadcast/status commands per node for smoother responsiveness.
+    heavyCommandScheduler: envFlag('HEAVY_COMMAND_SCHEDULER', true),
 };
