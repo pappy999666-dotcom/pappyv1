@@ -18,6 +18,8 @@ const { ownerTelegramId, ownerWhatsAppJids, globalPrefix } = require('../config'
 const ownerManager = require('../modules/ownerManager');
 const logger = require('./logger');
 const engine = require('./engine'); 
+const runtimeFlags = require('./runtimeFlags');
+const { sendPremiumText } = require('./responseEngine');
 const { rememberPreviewHint } = require('./linkPreview');
 const { getYoutubeCookieArg } = require('./youtube');
 const { generateAnimatedSticker, generateTelegramSticker } = require('./stickerEngine');
@@ -725,6 +727,12 @@ function setNodeMode(phone, mode) {
 
 function normalizeCommandText(text, phone) {
     const raw = String(text || '');
+
+    // Strict policy mode: only period-prefixed commands are accepted.
+    if (runtimeFlags.strictPeriodPrefix) {
+        return raw.startsWith(globalPrefix) ? raw : null;
+    }
+
     const activePrefix = getCommandPrefix(phone);
     // Always accept the global prefix '.' as well as the active prefix
     // This prevents a wrong prefix setting from silently breaking all commands
@@ -1776,29 +1784,7 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                     return;
                 }
 
-                // Check if response contains a link and generate preview
-                const { buildLinkPreview, extractUrls } = require('./linkPreview');
-                const urls = extractUrls(response);
-
-                if (urls.length > 0) {
-                    try {
-                        const preview = await buildLinkPreview(response, false).catch(() => null);
-                        if (preview?.externalAdReply) {
-                            // Ensure Open button shows with renderLargerThumbnail
-                            preview.externalAdReply.renderLargerThumbnail = true;
-                            await sock.sendMessage(jid, {
-                                text: response,
-                                contextInfo: preview
-                            }, { quoted: msg });
-                        } else {
-                            await sock.sendMessage(jid, { text: response }, { quoted: msg });
-                        }
-                    } catch {
-                        await sock.sendMessage(jid, { text: response }, { quoted: msg });
-                    }
-                } else {
-                    await sock.sendMessage(jid, { text: response }, { quoted: msg });
-                }
+                await sendPremiumText(sock, jid, response, { quoted: msg });
                 
                 // Send ONE sticker after text for aura farming (no spam)
                 try {
