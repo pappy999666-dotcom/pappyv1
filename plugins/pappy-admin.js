@@ -958,6 +958,11 @@ module.exports = {
 
         // ── SET GROUP PFP (admin) ─────────────────────────────────────────────
         if (cmd === '.setgrppfp') {
+            const gate = guardGroupMetadataMutation({ jid, command: cmd, action: 'profile-picture' });
+            if (!gate.ok) {
+                const waitSec = Math.max(1, Math.ceil(Number(gate.waitMs || 0) / 1000));
+                return sock.sendMessage(jid, { text: gate.reason === 'cooldown' ? `⏳ Group metadata cooldown active. Retry in ${waitSec}s.` : '⚠️ Group metadata guard blocked this action.' }, { quoted: msg });
+            }
             const quotedImg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage
                 || msg.message?.imageMessage;
             if (!quotedImg) return sock.sendMessage(jid, { text: '❌ Reply to or send an image to set as group photo.' }, { quoted: msg });

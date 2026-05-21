@@ -7,6 +7,7 @@ const ALLOWED_GROUP_META_COMMANDS = new Set([
     '.unmute',
     '.setname',
     '.setdesc',
+    '.setgrppfp',
 ]);
 
 const META_COOLDOWN_MS = Math.max(3000, Number(process.env.GROUP_META_COOLDOWN_MS || 12000));
