@@ -4171,8 +4171,17 @@ async function startTelegram() {
 
         try {
             const cycles = await readIntelNodeCycles();
-            if (cycles && cycles[sessionKey]) {
-                delete cycles[sessionKey];
+            if (cycles) {
+                const existing = cycles[sessionKey] || {};
+                const preservedCursor = Number(existing.cursor || 0);
+                // Keep cursor progression so reset moves to a fresh window instead of reusing the same first chunk.
+                cycles[sessionKey] = {
+                    ...existing,
+                    cursor: Number.isFinite(preservedCursor) && preservedCursor >= 0 ? preservedCursor : 0,
+                    activeCodes: [],
+                    startedAt: Date.now(),
+                    lastManualResetAt: Date.now(),
+                };
                 await writeIntelNodeCycles(cycles);
             }
             const resumePath = path.join(__dirname, `../data/intel_join_${sessionKey}.json`);
