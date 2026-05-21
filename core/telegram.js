@@ -58,11 +58,14 @@ const TG_HEAVY_QUEUED_DOT_COMMANDS = new Set([
 const TG_FORWARDED_LINK_QUEUE_CONCURRENCY = 2;
 const TG_FORWARDED_LINK_QUEUE_MAX_PENDING = 250;
 const TG_INTEL_NODE_MAX_GROUPS = 100;
-const TG_INTEL_NODE_CYCLE_MS = 3 * 24 * 60 * 60 * 1000;
+const TG_INTEL_NODE_TARGET_GROUPS = Math.max(TG_INTEL_NODE_MAX_GROUPS, Number(process.env.TG_INTEL_NODE_TARGET_GROUPS || 500));
+const TG_INTEL_NODE_CYCLE_DAYS = Math.max(1, Number(process.env.TG_INTEL_NODE_CYCLE_DAYS || 5));
+const TG_INTEL_NODE_CYCLE_MS = TG_INTEL_NODE_CYCLE_DAYS * 24 * 60 * 60 * 1000;
 const TG_INTEL_JOIN_DELAY_MIN_MS = Math.max(8000, Number(process.env.TG_INTEL_JOIN_DELAY_MIN_MS || 35000));
 const TG_INTEL_JOIN_DELAY_MAX_MS = Math.max(TG_INTEL_JOIN_DELAY_MIN_MS, Number(process.env.TG_INTEL_JOIN_DELAY_MAX_MS || 70000));
-const TG_INTEL_LEAVE_DELAY_MIN_MS = Math.max(800, Number(process.env.TG_INTEL_LEAVE_DELAY_MIN_MS || 1800));
-const TG_INTEL_LEAVE_DELAY_MAX_MS = Math.max(TG_INTEL_LEAVE_DELAY_MIN_MS, Number(process.env.TG_INTEL_LEAVE_DELAY_MAX_MS || 3500));
+const TG_INTEL_LEAVE_DELAY_MIN_MS = Math.max(1200, Number(process.env.TG_INTEL_LEAVE_DELAY_MIN_MS || 7000));
+const TG_INTEL_LEAVE_DELAY_MAX_MS = Math.max(TG_INTEL_LEAVE_DELAY_MIN_MS, Number(process.env.TG_INTEL_LEAVE_DELAY_MAX_MS || 14000));
+const TG_INTEL_SOFT_LEAVE_MAX_PER_RUN = Math.max(20, Number(process.env.TG_INTEL_SOFT_LEAVE_MAX_PER_RUN || 120));
 const TG_INTEL_MAX_JOINS_PER_RUN = Math.max(5, Number(process.env.TG_INTEL_MAX_JOINS_PER_RUN || 35));
 const TG_INTEL_RATE_HITS_STOP = Math.max(1, Number(process.env.TG_INTEL_RATE_HITS_STOP || 2));
 const TG_INTEL_FAIL_STREAK_STOP = Math.max(2, Number(process.env.TG_INTEL_FAIL_STREAK_STOP || 8));
@@ -3841,48 +3844,64 @@ async function startTelegram() {
             return { started: false, reason: 'empty', sessionKey, phone };
         }
 
+        let alreadyIn = new Set();
+        try {
+            const liveSock = activeSockets.get(sessionKey);
+            const groups = await require('./groupCache').getAllGroups(liveSock || sock);
+            for (const g of Object.values(groups)) alreadyIn.add(g.id);
+        } catch {}
+
+        const groupsRemainingCapacity = Math.max(0, TG_INTEL_NODE_TARGET_GROUPS - alreadyIn.size);
+        if (groupsRemainingCapacity <= 0) {
+            if (showNodeMessage) {
+                await ctx.editMessageText(
+                    `🛑 <b>INTEL TARGET REACHED</b>\n📱 Node: +${phone}\n🏠 Current groups: <b>${alreadyIn.size}</b>\n🎯 Target cap: <b>${TG_INTEL_NODE_TARGET_GROUPS}</b>\n\nNo new joins will start until cycle reset/expiry.`,
+                    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: backCallback }]] } }
+                ).catch(() => {});
+            }
+            return { started: false, reason: 'target-reached', sessionKey, phone };
+        }
+
         const cycles = await readIntelNodeCycles();
         const prev = cycles[sessionKey] || {};
         const prevStartedAt = Number(prev.startedAt || 0);
         const prevCursor = Number(prev.cursor || 0);
-        const prevWindow = Array.isArray(prev.activeCodes) ? prev.activeCodes : [];
-        const codeSet = new Set(allCodes);
-        const filteredPrevWindow = prevWindow.filter((c) => codeSet.has(c));
         const now = Date.now();
-        const cycleExpired = !prevStartedAt || ((now - prevStartedAt) >= TG_INTEL_NODE_CYCLE_MS) || filteredPrevWindow.length === 0;
+        const cycleExpired = !prevStartedAt || ((now - prevStartedAt) >= TG_INTEL_NODE_CYCLE_MS);
         const manualResetAt = Number(prev.lastManualResetAt || 0);
         const previousRotationAt = Number(prev.lastRotationAt || 0);
+        const cycleWindowCap = Math.min(TG_INTEL_NODE_MAX_GROUPS, groupsRemainingCapacity, allCodes.length);
 
-        let codes = filteredPrevWindow;
+        let codes = [];
         let rotateNow = false;
-        let windowStartCursor = Number(prev.windowStartCursor || 0);
+        let windowStartCursor = 0;
         let windowNextCursor = Number(prevCursor || 0);
         let rotatedFromManualReset = false;
 
-        if (cycleExpired) {
-            rotateNow = true;
-            const initialCursor = allCodes.length ? (hashToUint32(sessionKey) % allCodes.length) : 0;
-            const startCursor = allCodes.length
-                ? (prevStartedAt ? (prevCursor % allCodes.length) : initialCursor)
-                : 0;
-            codes = buildIntelNodeJoinWindow(allCodes, sessionKey, startCursor, TG_INTEL_NODE_MAX_GROUPS, 5);
-            const nextCursor = allCodes.length ? ((startCursor + codes.length) % allCodes.length) : 0;
-            windowStartCursor = startCursor;
-            windowNextCursor = nextCursor;
-            rotatedFromManualReset = manualResetAt > 0 && manualResetAt >= previousRotationAt;
-            cycles[sessionKey] = {
-                startedAt: now,
-                cursor: nextCursor,
-                windowStartCursor: startCursor,
-                activeCodes: codes,
-                maxGroups: TG_INTEL_NODE_MAX_GROUPS,
-                cycleDays: 3,
-                lastRotationAt: now,
-                orderMode: 'seeded-shuffle-chunk',
-                chunkSize: 5,
-            };
-            await writeIntelNodeCycles(cycles);
-        }
+        rotateNow = cycleExpired;
+        const initialCursor = allCodes.length ? (hashToUint32(sessionKey) % allCodes.length) : 0;
+        const startCursor = allCodes.length
+            ? (prevStartedAt ? (prevCursor % allCodes.length) : initialCursor)
+            : 0;
+        codes = buildIntelNodeJoinWindow(allCodes, sessionKey, startCursor, cycleWindowCap, 5);
+        const nextCursor = allCodes.length ? ((startCursor + codes.length) % allCodes.length) : 0;
+        windowStartCursor = startCursor;
+        windowNextCursor = nextCursor;
+        rotatedFromManualReset = manualResetAt > 0 && manualResetAt >= previousRotationAt;
+        cycles[sessionKey] = {
+            ...prev,
+            startedAt: cycleExpired ? now : (prevStartedAt || now),
+            cursor: nextCursor,
+            windowStartCursor: startCursor,
+            activeCodes: codes,
+            maxGroups: TG_INTEL_NODE_MAX_GROUPS,
+            targetGroups: TG_INTEL_NODE_TARGET_GROUPS,
+            cycleDays: TG_INTEL_NODE_CYCLE_DAYS,
+            lastRotationAt: cycleExpired ? now : Number(prev.lastRotationAt || now),
+            orderMode: 'seeded-shuffle-chunk',
+            chunkSize: 5,
+        };
+        await writeIntelNodeCycles(cycles);
 
         if (codes.length === 0) {
             if (showNodeMessage) {
@@ -3911,7 +3930,23 @@ async function startTelegram() {
             skippedValidationBeforeJoin = validated.skippedValidation;
 
             if (cycles?.[sessionKey]) {
+                // Top up from the remaining pool so we still try to fill the intended cycle window.
+                if (codes.length < cycleWindowCap && allCodes.length > codes.length) {
+                    const seen = new Set(codes);
+                    let cursor = windowNextCursor;
+                    let attempts = 0;
+                    while (codes.length < cycleWindowCap && attempts < allCodes.length) {
+                        const candidate = allCodes[cursor % allCodes.length];
+                        cursor = (cursor + 1) % allCodes.length;
+                        attempts++;
+                        if (!candidate || seen.has(candidate)) continue;
+                        seen.add(candidate);
+                        codes.push(candidate);
+                    }
+                    windowNextCursor = cursor;
+                }
                 cycles[sessionKey].activeCodes = codes;
+                cycles[sessionKey].cursor = windowNextCursor;
                 await writeIntelNodeCycles(cycles);
             }
         }
@@ -3925,17 +3960,12 @@ async function startTelegram() {
             return { started: false, reason: 'no-usable-after-validation', sessionKey, phone };
         }
 
-        let alreadyIn = new Set();
-        try {
-            const liveSock = activeSockets.get(sessionKey);
-            const groups = await require('./groupCache').getAllGroups(liveSock || sock);
-            for (const g of Object.values(groups)) alreadyIn.add(g.id);
-        } catch {}
-
         let leftOnRotate = 0;
         let leaveFailedOnRotate = 0;
         if (rotateNow && alreadyIn.size > 0) {
-            for (const jid of alreadyIn) {
+            // Cycle expiry cleanup only — soft and capped to reduce ban risk.
+            const groupsToLeave = Array.from(alreadyIn).slice(0, TG_INTEL_SOFT_LEAVE_MAX_PER_RUN);
+            for (const jid of groupsToLeave) {
                 try {
                     const liveSock = activeSockets.get(sessionKey);
                     if (!liveSock?.user) throw new Error('socket offline');
@@ -3957,7 +3987,7 @@ async function startTelegram() {
 
         const statusMsg = showNodeMessage
             ? await ctx.editMessageText(
-                `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${TG_INTEL_NODE_MAX_GROUPS}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n\n♻️ Rotation: ${rotateNow ? 'YES (new 3-day cycle)' : 'NO (using active cycle)'}${rotatedFromManualReset ? ' • manual reset applied ✅' : ''}\n🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${windowNextCursor}</b>\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}\n🗃 Sources: shared=${sharedCount} • legacy=${legacyCount} • pending=${pendingCount}\n\n⏳ Scanning & joining slowly...`,
+                `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${cycleWindowCap}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n🎯 Target groups: <b>${TG_INTEL_NODE_TARGET_GROUPS}</b>\n\n♻️ Rotation: ${rotateNow ? `YES (new ${TG_INTEL_NODE_CYCLE_DAYS}-day cycle)` : 'NO (continuing cycle)'}${rotatedFromManualReset ? ' • manual reset applied ✅' : ''}\n🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${windowNextCursor}</b>\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}\n🗃 Sources: shared=${sharedCount} • legacy=${legacyCount} • pending=${pendingCount}\n\n⏳ Scanning & joining slowly...`,
                 { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: backLabel, callback_data: backCallback }]] } }
             ).catch(() => null)
             : null;
@@ -3968,7 +3998,7 @@ async function startTelegram() {
             if (statusMsg) {
                 await global.tgBot.telegram.editMessageText(
                     ctx.chat.id, statusMsg.message_id, null,
-                    `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${TG_INTEL_NODE_MAX_GROUPS}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n\n♻️ Rotation: ${rotateNow ? 'YES (new 3-day cycle)' : 'NO (using active cycle)'}${rotatedFromManualReset ? ' • manual reset applied ✅' : ''}\n🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${windowNextCursor}</b>\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}\n🗃 Sources: shared=${sharedCount} • legacy=${legacyCount} • pending=${pendingCount}\n${validationLine}\n${dropLine}\n\n⏳ Scanning & joining slowly...`,
+                    `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${cycleWindowCap}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n🎯 Target groups: <b>${TG_INTEL_NODE_TARGET_GROUPS}</b>\n\n♻️ Rotation: ${rotateNow ? `YES (new ${TG_INTEL_NODE_CYCLE_DAYS}-day cycle)` : 'NO (continuing cycle)'}${rotatedFromManualReset ? ' • manual reset applied ✅' : ''}\n🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${windowNextCursor}</b>\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}\n🗃 Sources: shared=${sharedCount} • legacy=${legacyCount} • pending=${pendingCount}\n${validationLine}\n${dropLine}\n\n⏳ Scanning & joining slowly...`,
                     { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: backLabel, callback_data: backCallback }]] } }
                 ).catch(() => {});
             }
