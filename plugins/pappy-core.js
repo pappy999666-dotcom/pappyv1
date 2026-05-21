@@ -475,6 +475,22 @@ module.exports = {
                         selectableCount: 1,
                     }
                 }, { quoted: msg });
+
+                if (!global._songPollLookup) global._songPollLookup = new Map();
+                if (pollMsg?.key?.id) {
+                    const optionMap = {};
+                    pageResults.forEach((r, i) => {
+                        const optionText = String(options[i] || '').replace(/\s*\[.*?\]\s*$/, '').trim().toLowerCase();
+                        if (optionText) optionMap[optionText] = r;
+                    });
+                    global._songPollLookup.set(pollMsg.key.id, {
+                        jid,
+                        results: pageResults,
+                        optionMap,
+                        createdAt: Date.now(),
+                    });
+                    setTimeout(() => global._songPollLookup?.delete(pollMsg.key.id), 10 * 60 * 1000).unref?.();
+                }
                 // Reply to the poll itself with next instructions
                 await sock.sendMessage(jid, {
                     text: `ℹ️ Tap your choice above to download

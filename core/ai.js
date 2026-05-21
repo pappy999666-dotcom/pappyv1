@@ -744,8 +744,8 @@ async function searchVideo(query) {
     try {
         const results = await searchYoutube(safeQuery, 1);
         if (!results.length) throw new Error('No results');
-          const { buffer, title, mimetype, fileExt } = await downloadVideo(results[0].videoId);
-          return { buffer, title: title || safeQuery, mimetype: mimetype || 'video/mp4', fileExt: fileExt || 'mp4' };
+            const { buffer, title, mimetype, fileExt } = await downloadVideo(results[0].videoId);
+            return { buffer, title: title || safeQuery, mimetype: mimetype || 'video/mp4', fileExt: fileExt || 'mp4', url: results[0].url || `https://www.youtube.com/watch?v=${results[0].videoId}` };
     } catch (err) {
         // Fallback to yt-dlp
         const { exec } = require('child_process');
@@ -761,7 +761,7 @@ async function searchVideo(query) {
         if (!fs.existsSync(outPath)) throw new Error('Video download failed');
         const buffer = await fs.promises.readFile(outPath);
         fs.unlink(outPath, () => {});
-          return { buffer, title: safeQuery, mimetype: 'video/mp4', fileExt: 'mp4' };
+          return { buffer, title: safeQuery, mimetype: 'video/mp4', fileExt: 'mp4', url: '' };
     }
 }
 

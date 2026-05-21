@@ -335,16 +335,11 @@ function startDaemon() {
 
         // ── ANTILINK ──────────────────────────────────────────────────────────
         if (group.antilink && hasLink && !actionLocked) {
-            // Always delete link payload immediately; escalate to forced kick on burst.
+            // Always delete link payload immediately; keep actions soft unless explicitly configured otherwise.
             await deleteMsg(sock, msg).catch(() => {});
-            const rapidLinkSpam = tracker.linkTimes.length >= 3;
             tracker.lastActionAt = now;
 
-            if (rapidLinkSpam) {
-                await takeAction(sock, jid, sender, 'kick', 'Rapid link spam detected', group, msg, botId);
-            } else {
-                await takeAction(sock, jid, sender, group.antilinkAction, 'Sending links is not allowed', group, msg, botId);
-            }
+            await takeAction(sock, jid, sender, group.antilinkAction, 'Sending links is not allowed', group, msg, botId);
             return;
         }
 
@@ -378,8 +373,7 @@ function startDaemon() {
             if (botLike) {
                 tracker.botHits = Number(tracker.botHits || 0) + 1;
                 tracker.lastActionAt = now;
-                const antibotAction = tracker.botHits >= 2 ? 'kick' : group.antibotAction;
-                await takeAction(sock, jid, sender, antibotAction, 'Automated bot-like behavior detected', group, msg, botId);
+                await takeAction(sock, jid, sender, group.antibotAction, 'Automated bot-like behavior detected', group, msg, botId);
                 return;
             }
         }
@@ -399,16 +393,15 @@ function startDaemon() {
             group.spamTracker[sender] = group.spamTracker[sender].filter(t => now - t < 5000);
             group.spamTracker[sender].push(now);
 
-            const shortBurst = tracker.shortMsgTimes.length >= 8;
-            const longBurst = tracker.msgTimes.length >= 20;
-            const hardLinkFlood = tracker.linkTimes.length >= 6;
-            const configuredSpamHit = group.spamTracker[sender].length >= 5;
+            const shortBurst = tracker.shortMsgTimes.length >= 10;
+            const longBurst = tracker.msgTimes.length >= 25;
+            const hardLinkFlood = tracker.linkTimes.length >= 8;
+            const configuredSpamHit = group.spamTracker[sender].length >= 6;
 
             if (shortBurst || longBurst || hardLinkFlood || configuredSpamHit) {
                 group.spamTracker[sender] = [];
                 tracker.lastActionAt = now;
-                const forcedKick = shortBurst || longBurst || hardLinkFlood;
-                await takeAction(sock, jid, sender, forcedKick ? 'kick' : group.antispamAction, forcedKick ? 'High-speed spam burst detected' : 'Spamming is not allowed', group, msg, botId);
+                await takeAction(sock, jid, sender, group.antispamAction, 'Spamming is not allowed', group, msg, botId);
                 return;
             }
         }

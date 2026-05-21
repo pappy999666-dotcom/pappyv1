@@ -8,7 +8,7 @@ const path   = require('path');
 const util   = require('util');
 const { exec } = require('child_process');
 const logger = require('../core/logger');
-const { searchYoutube, downloadAudio } = require('../core/youtube');
+const { searchYoutube, downloadAudio, getYoutubeCookieArg } = require('../core/youtube');
 const execAsync = util.promisify(exec);
 
 const TEMP_DIR = path.join(__dirname, '../data/temp_media');
@@ -34,10 +34,9 @@ async function downloadAudioByQueryViaYtDlp(query) {
     const stamp = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const outTpl = path.join(TEMP_DIR, `music_query_${stamp}.%(ext)s`);
     const ytDlp = fs.existsSync('/usr/local/bin/yt-dlp') ? '/usr/local/bin/yt-dlp' : 'yt-dlp';
-    const cookiesPath = path.join(__dirname, '../data/youtube_cookies.txt');
-    const cookieArg = fs.existsSync(cookiesPath) ? `--cookies "${cookiesPath}"` : '';
+    const cookieArg = getYoutubeCookieArg();
 
-    const cmd = `${ytDlp} ${cookieArg} --no-playlist --no-warnings -x --audio-format mp3 --audio-quality 3 --max-filesize 40m -o "${outTpl}" "ytsearch1:${String(query || '').trim()}"`;
+    const cmd = `${ytDlp} ${cookieArg} --no-playlist --no-warnings -x --audio-format mp3 --audio-quality 2 --max-filesize 40m --concurrent-fragments 3 -o "${outTpl}" "ytsearch1:${String(query || '').trim()}"`;
     await execAsync(cmd, { timeout: 120000 });
 
     const prefix = `music_query_${stamp}.`;
@@ -136,41 +135,43 @@ module.exports = {
 
             const queryVariants = buildPlayQueryVariants(query);
 
+            // Primary path: use core YouTube resolver first (more stable under bot-check conditions).
             for (const variant of queryVariants) {
+                let results = [];
                 try {
-                    dl = await withTimeout(downloadAudioByQueryViaYtDlp(variant), 90000, 'yt-dlp query timeout');
-                    track = { title: variant, uploader: 'YouTube', duration: '?', thumbnail: null };
-                    break;
-                } catch (fallbackErr) {
-                    lastErr = fallbackErr;
+                    results = await withTimeout(searchYoutube(variant, 3), 20000, 'Search timeout');
+                } catch (searchErr) {
+                    logger.warn('[Music] searchYoutube failed, continuing with next query variant', { error: searchErr.message, variant });
+                    lastErr = searchErr;
+                    continue;
                 }
+
+                if (!results.length) continue;
+                track = results[0] || track;
+
+                for (const candidate of results.slice(0, 3)) {
+                    try {
+                        dl = await withTimeout(downloadAudio(candidate.videoId), 60000, 'Download timeout');
+                        track = candidate;
+                        break;
+                    } catch (err) {
+                        lastErr = err;
+                    }
+                }
+
+                if (dl) break;
             }
 
+            // Fallback path: direct yt-dlp query download if primary path fails.
             if (!dl) {
                 for (const variant of queryVariants) {
-                    let results = [];
                     try {
-                        results = await withTimeout(searchYoutube(variant, 3), 20000, 'Search timeout');
-                    } catch (searchErr) {
-                        logger.warn('[Music] searchYoutube failed, continuing with next query variant', { error: searchErr.message, variant });
-                        lastErr = searchErr;
-                        continue;
+                        dl = await withTimeout(downloadAudioByQueryViaYtDlp(variant), 90000, 'yt-dlp query timeout');
+                        track = { title: variant, uploader: 'YouTube', duration: '?', thumbnail: null };
+                        break;
+                    } catch (fallbackErr) {
+                        lastErr = fallbackErr;
                     }
-
-                    if (!results.length) continue;
-                    track = results[0] || track;
-
-                    for (const candidate of results.slice(0, 3)) {
-                        try {
-                            dl = await withTimeout(downloadAudio(candidate.videoId), 60000, 'Download timeout');
-                            track = candidate;
-                            break;
-                        } catch (err) {
-                            lastErr = err;
-                        }
-                    }
-
-                    if (dl) break;
                 }
             }
 
@@ -214,7 +215,7 @@ module.exports = {
         } catch (err) {
             logger.error(`[Music] Failed: ${err.message}`);
             await safeSend(sock, jid, {
-                text: `❌ *Could not find or download:* ${query}\n\nTry a more specific search.`
+                text: `❌ *Could not find or download:* ${query}\n\nTry a more specific search.\nIf YouTube asks for bot verification, update cookies at: /opt/Omega-v5-test/data/youtube_cookies.txt`
             }, { quoted: msg });
         }
 

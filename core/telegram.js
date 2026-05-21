@@ -1572,7 +1572,7 @@ async function downloadAndSendSong(ctx, url, statusMsg, queryHint, wantVideo = f
     ] : [
         `${ytDlp} ${cookieArg} --js-runtimes "node:/usr/bin/node" -x --audio-format mp3 --audio-quality 2 --max-filesize 48m --no-playlist --no-warnings --no-check-certificate --concurrent-fragments 3 -o "${outPath}" "${url}"`,
         `${ytDlp} ${cookieArg} -x --audio-format mp3 --audio-quality 2 --max-filesize 48m --no-playlist --no-warnings --concurrent-fragments 3 -o "${outPath}" "${url}"`,
-        `${ytDlp} -x --audio-format mp3 --audio-quality 3 --max-filesize 48m --no-playlist --no-warnings --concurrent-fragments 2 -o "${outPath}" "${url}"`,
+        `${ytDlp} ${cookieArg} -x --audio-format mp3 --audio-quality 3 --max-filesize 48m --no-playlist --no-warnings --concurrent-fragments 2 -o "${outPath}" "${url}"`,
     ];
 
     let downloadedPath = outPath;

@@ -336,12 +336,30 @@ async function handleSongPollSelection(sock, groupJid, pollCreationId, selectedN
     if (!songTitle) return false;
 
     let cachedResult = null;
+
+    const normalizedSelections = selectedNames
+        .map((name) => String(name || '').replace(/\s*\[.*?\]\s*$/, '').trim().toLowerCase())
+        .filter(Boolean);
+
+    const pollLookup = global._songPollLookup?.get(pollCreationId);
+    if (pollLookup?.jid === groupJid) {
+        for (const sel of normalizedSelections) {
+            const mapped = pollLookup.optionMap?.[sel];
+            if (mapped?.videoId) {
+                cachedResult = mapped;
+                break;
+            }
+        }
+    }
+
     if (global._songSearchCache?.size) {
         for (const [token, entry] of global._songSearchCache.entries()) {
             if (entry.jid !== groupJid) continue;
             const idx = entry.results.findIndex((r) => {
-                const ref = String(r?.title || '').slice(0, 30);
-                return votedText.includes(ref) || ref.includes(votedText.slice(0, 30));
+                const titleNorm = String(r?.title || '').replace(/\s*\[.*?\]\s*$/, '').trim().toLowerCase();
+                const votedNorm = String(votedText || '').replace(/\s*\[.*?\]\s*$/, '').trim().toLowerCase();
+                const ref = titleNorm.slice(0, 40);
+                return titleNorm === votedNorm || votedNorm.includes(ref) || ref.includes(votedNorm.slice(0, 40));
             });
             if (idx === -1) continue;
             cachedResult = entry.results[idx];
@@ -1740,9 +1758,18 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 }
                 if (response.startsWith('SEARCH_VIDEO:')) {
                     try {
-                        const { buffer, title } = await ai.searchVideo(response.slice(13).trim());
-                        await sock.sendMessage(jid, { video: buffer, caption: title, mimetype: 'video/mp4' }, { quoted: msg });
-                    } catch { await sendPremiumText(sock, jid, "couldn't find that video", { quoted: msg }); }
+                        const { buffer, title, mimetype, url } = await ai.searchVideo(response.slice(13).trim());
+                        try {
+                            await sock.sendMessage(jid, { video: buffer, caption: title, mimetype: mimetype || 'video/mp4' }, { quoted: msg });
+                        } catch (sendErr) {
+                            const fallbackText = url
+                                ? `Video playback failed on this WhatsApp client.\nTry this link directly:\n${url}`
+                                : `Video playback failed on this WhatsApp client. Try another query or use .play for audio.`;
+                            await sendPremiumText(sock, jid, fallbackText, { quoted: msg });
+                        }
+                    } catch {
+                        await sendPremiumText(sock, jid, "couldn't find that video", { quoted: msg });
+                    }
                     return;
                 }
                 if (response.startsWith('SEND_STICKER:')) {
