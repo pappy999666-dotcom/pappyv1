@@ -41,6 +41,20 @@ class CoreHealthMonitor {
             this.logger?.warn?.(`[Health] Event loop lag spike: ${Math.round(lagMs)}ms`);
         }
     }
+
+    /**
+     * Called by external monitors before they attempt a reconnect.
+     * Returns true if it is safe to reconnect (no other reconnect in flight).
+     * This is the single coordination gate that prevents triple-reconnect storms.
+     */
+    canReconnect(sessionKey) {
+        if (!this.reconnectManager) return true;
+        const s = this.reconnectManager.get(sessionKey);
+        // Block if already reconnecting or a lock is held
+        if (s.status === 'RECONNECTING') return false;
+        if (this.reconnectManager.locks?.has(sessionKey)) return false;
+        return true;
+    }
 }
 
 module.exports = { CoreHealthMonitor };

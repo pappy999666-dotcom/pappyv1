@@ -64,14 +64,26 @@ function _write(level, message) {
 process.on('exit', () => { try { if (!_stream.closed) _stream.end(); } catch {} });
 
 module.exports = {
-    info:    (msg)       => _write('INFO',    String(msg || '')),
+    info:    (msg, meta) => {
+        const extra = typeof meta === 'undefined' ? '' : ` ${JSON.stringify(meta)}`;
+        _write('INFO', `${String(msg || '')}${extra}`.trim());
+    },
     debug:   (msg, meta) => {
         const extra = typeof meta === 'undefined' ? '' : ` ${JSON.stringify(meta)}`;
         _write('DEBUG', `${String(msg || '')}${extra}`.trim());
     },
-    success: (msg)       => _write('SUCCESS', String(msg || '')),
-    warn:    (msg)       => _write('WARN',    String(msg || '')),
-    system:  (msg)       => _write('SYSTEM',  String(msg || '')),
+    success: (msg, meta) => {
+        const extra = typeof meta === 'undefined' ? '' : ` ${JSON.stringify(meta)}`;
+        _write('SUCCESS', `${String(msg || '')}${extra}`.trim());
+    },
+    warn:    (msg, meta) => {
+        const extra = typeof meta === 'undefined' ? '' : ` ${JSON.stringify(meta)}`;
+        _write('WARN', `${String(msg || '')}${extra}`.trim());
+    },
+    system:  (msg, meta) => {
+        const extra = typeof meta === 'undefined' ? '' : ` ${JSON.stringify(meta)}`;
+        _write('SYSTEM', `${String(msg || '')}${extra}`.trim());
+    },
     error:   (msg, err)  => {
         const extra = err?.stack || err?.message || (err ? String(err) : '');
         _write('ERROR', extra ? `${msg} ${extra}` : String(msg || ''));

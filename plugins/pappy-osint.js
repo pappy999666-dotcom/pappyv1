@@ -6,6 +6,7 @@ const path = require('path');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const logger = require('../core/logger');
+const { addNewCode, hasValidatorEntry } = require('../core/linkValidator');
 
 const INTEL_DB_PATH = path.join(__dirname, '../data/intel.json');
 
@@ -23,17 +24,21 @@ function saveIntelCache(data) {
 }
 
 // The core extraction logic
-function extractAndQueueLinks(text, intelCache) {
+async function extractAndQueueLinks(text, intelCache, sock) {
     const regex = /chat\.whatsapp\.com\/([0-9A-Za-z]{20,24})/ig;
     let match;
     let addedCount = 0;
-    
+    const seen = new Set();
+
     while ((match = regex.exec(text)) !== null) {
-        const code = match[1];
-        if (!intelCache.knownLinks.includes(code) && !intelCache.pendingQueue.includes(code)) {
-            intelCache.pendingQueue.push(code);
-            addedCount++;
-        }
+        const code = String(match[1] || '').trim();
+        if (!code || seen.has(code)) continue;
+        seen.add(code);
+
+        if (hasValidatorEntry(code)) continue;
+        // Route to validator intake. Validator worker will classify and promote as needed.
+        const outcome = addNewCode(code, { source: 'osint_scrape', scrapedAt: Date.now() });
+        if (outcome === 'added') addedCount++;
     }
     return addedCount;
 }
@@ -73,7 +78,7 @@ module.exports = {
                 const $ = cheerio.load(response.data);
                 const pageText = $('body').text() + ' ' + response.data; // Check both visible text and raw HTML (hrefs)
 
-                const addedCount = extractAndQueueLinks(pageText, intelCache);
+                const addedCount = await extractAndQueueLinks(pageText, intelCache, sock);
 
                 if (addedCount > 0) {
                     saveIntelCache(intelCache);
@@ -96,7 +101,7 @@ module.exports = {
                 return sock.sendMessage(chat, { text: '❌ *Syntax:* Reply to a giant wall of text with `.massdrop` or paste it directly.' });
             }
 
-            const addedCount = extractAndQueueLinks(rawText, intelCache);
+            const addedCount = await extractAndQueueLinks(rawText, intelCache, sock);
 
             if (addedCount > 0) {
                 saveIntelCache(intelCache);

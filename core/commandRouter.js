@@ -18,13 +18,22 @@ const HEAVY_COMMANDS = new Set([
     '.loopcast', '.loopgodcast'
 ]);
 
+// Commands that run at most 1 at a time per node — prevents socket saturation
+const SERIALIZED_COMMANDS = new Set([
+    '.tag', '.tagall', '.ban', '.kick', '.promote', '.demote',
+    '.announce', '.delete', '.broadcast', '.invite',
+]);
+
 class CommandRouter {
     constructor() {
         this.plugins = new Map();
         this._running = new Map(); // runKey(botId:cmd) -> active execution count
-        this._MAX_CONCURRENT_PER_CMD_PER_NODE = 50;
-        // Instant commands bypass concurrency gates, execute immediately (like Telegram)
-        this._INSTANT_COMMANDS = new Set(['.play', '.search']);
+        // Reduced from 50 — prevents socket saturation under heavy group load
+        this._MAX_CONCURRENT_PER_CMD_PER_NODE = 3;
+        // Serialized commands: max 1 concurrent per node
+        this._MAX_CONCURRENT_SERIALIZED = 1;
+        // Instant commands bypass concurrency gates, execute immediately
+        this._INSTANT_COMMANDS = new Set(['.play', '.search', '.menu', '.ping', '.info', '.help']);
         this.loadPlugins();
         this.initBus();
     }
@@ -237,34 +246,36 @@ class CommandRouter {
                 userEngine.recordCommand(sender).catch(() => {});
 
                 const runCommand = async (abortSignal) => {
-                    // Apply soft work protection (delay to prevent bans)
+                    // SoftWork delay runs BEFORE acquiring the concurrency slot
+                    // so it never holds a slot open while waiting
                     const senderJid = String(sender || '').trim();
                     const softWorkSenderKey = `${senderJid}::${String(botId || 'global')}`;
                     const delayMs = await softWork.applySoftDelay(commandName, softWorkSenderKey);
-                    
-                    // 🧠 SaaS Detection: Does this plugin expect 1 object or 6 separate arguments?
+
                     if (command.execute.length === 1) {
-                        // Modern Style: execute({ sock, msg, ... })
                         await command.execute({ sock, msg, args, text, user: userProfile, isGroup, botId, abortSignal, softWorkDelay: delayMs });
                     } else {
-                        // Legacy Style: execute(sock, msg, args, user, commandName, abortSignal)
                         await command.execute(sock, msg, args, userProfile, commandName, abortSignal);
                     }
                 };
 
-                // Instant commands bypass concurrency gates — execute immediately (like Telegram's TG_INSTANT_DOT_COMMANDS)
+                // Instant commands bypass concurrency gates
                 const isInstant = this._INSTANT_COMMANDS.has(commandName);
+                // Serialized commands: max 1 concurrent per node (admin/moderation ops)
+                const isSerialized = SERIALIZED_COMMANDS.has(commandName);
+                const maxConcurrent = isSerialized
+                    ? this._MAX_CONCURRENT_SERIALIZED
+                    : this._MAX_CONCURRENT_PER_CMD_PER_NODE;
 
                 const executeWithTimeout = () => {
                     const runKey = `${String(botId || 'global')}:${String(commandName || '').toLowerCase()}`;
                     const activeCount = this._running.get(runKey) || 0;
-                    
-                    // Instant commands skip concurrency gate; others respect max concurrent per node+cmd
-                    if (!isInstant && activeCount >= this._MAX_CONCURRENT_PER_CMD_PER_NODE) {
-                        logger.warn(`[CommandRouter] Concurrency limit hit for ${commandName}, skipping`);
+
+                    if (!isInstant && activeCount >= maxConcurrent) {
+                        logger.warn(`[CommandRouter] Concurrency limit (${maxConcurrent}) hit for ${commandName} on ${botId}, dropping`);
                         return;
                     }
-                    
+
                     if (!isInstant) {
                         this._running.set(runKey, activeCount + 1);
                     }

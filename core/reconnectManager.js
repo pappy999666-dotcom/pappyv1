@@ -39,7 +39,10 @@ class ReconnectManager {
     }
 
     async schedule(sessionKey, reconnectFn, reasonOrOptions = 'close') {
-        if (this.locks.has(sessionKey)) return false;
+        if (this.locks.has(sessionKey)) {
+            this.logger?.info?.(`[Reconnect] ${sessionKey} already locked — skipping duplicate schedule`);
+            return false;
+        }
         const s = this.get(sessionKey);
         if (s.status === STATES.DESTROYED || s.status === STATES.DEAD) return false;
 

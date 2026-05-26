@@ -173,15 +173,29 @@ async function triggerWarmup(groupId, botId) {
     let sourceMessage = config.sourceMessage || null;
 
     if (!mediaPath && !sourceMessage && config.statusPayload) {
-        const url = (config.statusPayload.match(/https?:\/\/[^\s]+/) || [])[0];
-        if (url) {
+        const urlMatch = (config.statusPayload.match(/https?:\/\/[^\s]+/) || []);
+        if (urlMatch[0]) {
+            // Build extendedTextMessage with link preview so WA renders the preview card
+            sourceMessage = {
+                extendedTextMessage: {
+                    text: config.statusPayload,
+                    matchedText: urlMatch[0],
+                    canonicalUrl: urlMatch[0],
+                    previewType: 0,
+                }
+            };
+            // Try Redis cache for richer preview
             try {
                 const { connection: redis } = require('../services/redis');
-                const raw = await redis.get(`ext:${url.slice(0, 200)}`);
-                if (raw) sourceMessage = { extendedTextMessage: JSON.parse(raw) };
+                const raw = await redis.get(`ext:${urlMatch[0].slice(0, 200)}`);
+                if (raw) {
+                    const cached = JSON.parse(raw);
+                    sourceMessage = { extendedTextMessage: { ...sourceMessage.extendedTextMessage, ...cached } };
+                }
             } catch {}
+        } else {
+            sourceMessage = { conversation: String(config.statusPayload) };
         }
-        if (!sourceMessage) sourceMessage = { conversation: String(config.statusPayload) };
     }
 
     broadcastQueue.add(`WARMUP_${botId}_${groupId}`, {

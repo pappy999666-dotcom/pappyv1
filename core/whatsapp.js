@@ -181,7 +181,7 @@ const MAX_PEER_SESSION_FILES = 500;
 // Track decrypt failures per session — auto-prune signal files when they spike
 const _decryptFailCount = new Map();
 const _decryptPruneThrottle = new Map();
-const HEARTBEAT_IDLE_MS = Number(process.env.WA_HEARTBEAT_IDLE_MS || 600000);
+const HEARTBEAT_IDLE_MS = Number(process.env.WA_HEARTBEAT_IDLE_MS || 1200000); // 20min — gives godcast time to finish
 const HEARTBEAT_INTERVAL_MS = Number(process.env.WA_HEARTBEAT_INTERVAL_MS || 30000);
 const AI_MAX_QUEUE_SIZE = Number(process.env.WA_AI_MAX_QUEUE_SIZE || 6);
 const AI_USER_COOLDOWN_MS = Number(process.env.WA_AI_USER_COOLDOWN_MS || 5000);
@@ -1812,46 +1812,8 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 }
 
                 await sendPremiumText(sock, jid, response, { quoted: msg });
-                
-                // Send ONE sticker after text for aura farming (no spam)
-                try {
-                    const stickerPrompts = [
-                        'cool anime guy character with glowing aura aesthetic',
-                        'powerful anime male warrior energy aura',
-                        'aesthetic anime boy character epic vibe',
-                        'anime male character legendary pose glowing',
-                        'sigma anime guy energy aesthetic',
-                        'anime male protagonist power up aura glowing',
-                        'cool anime girl character with glowing aura aesthetic',
-                        'aesthetic anime girl character epic vibe'
-                    ];
-                    
-                    const randomPrompt = stickerPrompts[Math.floor(Math.random() * stickerPrompts.length)];
-                    const cacheKey = Buffer.from(randomPrompt).toString('base64').slice(0, 20);
-                    
-                    let stickerBuffer;
-                    if (global.stickerCache.has(cacheKey)) {
-                        stickerBuffer = global.stickerCache.get(cacheKey);
-                    } else {
-                        const imgBuffer = await Promise.race([
-                            ai.generateImage(randomPrompt),
-                            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
-                        ]);
-                        
-                        const generated = await generateAnimatedSticker(imgBuffer);
-                        stickerBuffer = generated.buffer;
-                        
-                        if (global.stickerCache.size >= 50) {
-                            const firstKey = global.stickerCache.keys().next().value;
-                            global.stickerCache.delete(firstKey);
-                        }
-                        global.stickerCache.set(cacheKey, stickerBuffer);
-                    }
-                    
-                    await sock.sendMessage(jid, { sticker: stickerBuffer, stickerMetadata: { packName: 'Ω Pappy Ultimate', packPublish: 'pappylung', packId: 'pappy-ultimate-v5', categories: ['🔥'], isAvatar: false, isAiSticker: true } });
-                } catch (err) {
-                    logger.error(`[AI] Sticker after text failed: ${err.message}`);
-                }
+                // Post-text sticker removed: was generating + sending an animated sticker
+                // after every AI text reply, doubling socket load and blocking the event loop.
 
             } catch (err) {
                 logger.warn(`[AI] Failed: ${err.message}`);
@@ -1894,27 +1856,10 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
     });
 
     // ── POLL VOTE HANDLER — poll votes come as pollUpdateMessage in messages.upsert ──
-    sock.ev.on('messages.upsert', async ({ messages: pollMsgs, type: pollType }) => {
-        if (pollType !== 'notify') return;
-        for (const pollMsg of pollMsgs) {
-            try {
-                const pollUpdate = pollMsg.message?.pollUpdateMessage;
-                if (!pollUpdate) continue;
-                const groupJid = pollMsg.key?.remoteJid;
-                const pollCreationMsgKey = pollUpdate.pollCreationMessageKey;
-                const cachedPoll = global.messageCache?.get(pollCreationMsgKey?.id);
-                const pollName = cachedPoll?.message?.pollCreationMessageV3?.name || cachedPoll?.message?.pollCreationMessage?.name || '';
-                if (!pollName.includes('Pick a song')) continue;
+    // NOTE: This is handled inside the primary messages.upsert handler above.
+    // A second sock.ev.on('messages.upsert') registration was removed here to
+    // prevent duplicate listener stacking which doubled event processing load.
 
-                const selectedNames = (await resolveSongPollSelections(pollUpdate, cachedPoll))
-                    .map((name) => String(name || '').replace(/\s*\[.*?\]\s*$/, '').trim())
-                    .filter(Boolean);
-                if (!selectedNames.length) continue;
-
-                await handleSongPollSelection(sock, groupJid, pollCreationMsgKey?.id || pollMsg.key?.id || '', selectedNames);
-            } catch {}
-        }
-    });
 
     sock.ev.on('groups.update', (updates) => {
         if (!global._groupInvalidateQueues) global._groupInvalidateQueues = new Map();

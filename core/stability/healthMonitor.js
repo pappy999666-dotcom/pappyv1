@@ -21,7 +21,7 @@
 
 const logger       = require('../logger');
 const os           = require('os');
-const { execSync } = require('child_process');
+// avoid importing blocking execSync to prevent accidental event-loop stalls
 const { ownerTelegramId } = require('../../config');
 
 // ── THRESHOLDS ──────────────────────────────────────────────────────
@@ -178,11 +178,20 @@ async function _checkSessions() {
             setTimeout(() => _pendingPings.delete(sessionKey), 10_000).unref();
         }
 
-        // Force close dead sessions — connection.update will handle reconnect
+        // Force close dead sessions — connection.update will handle reconnect.
+        // GUARD: only fire if no other reconnect is already in progress for this session.
         if (lastActivity > 0 && silent > THRESHOLDS.sessionDeadMs) {
-            logger.error(`[HealthMonitor] Session ${sessionKey} dead (${Math.round(silent / 60000)}min silent) — forcing reconnect`);
-            try { sock.ws?.close(); } catch {}
-            if (global._lastMsgActivity) global._lastMsgActivity.delete(sessionKey);
+            const kernel = (() => { try { return require('../runtimeKernel').getKernel(); } catch { return null; } })();
+            const alreadyReconnecting = kernel?.healthMonitor?.canReconnect
+                ? !kernel.healthMonitor.canReconnect(sessionKey)
+                : false;
+            if (!alreadyReconnecting) {
+                logger.error(`[HealthMonitor] Session ${sessionKey} dead (${Math.round(silent / 60000)}min silent) — forcing reconnect`);
+                try { sock.ws?.close(); } catch {}
+                if (global._lastMsgActivity) global._lastMsgActivity.delete(sessionKey);
+            } else {
+                logger.info(`[HealthMonitor] Session ${sessionKey} dead but reconnect already in progress — skipping duplicate`);
+            }
         }
 
         // Detect outgoing activity without incoming receipts (classic blocked-inbound symptom).

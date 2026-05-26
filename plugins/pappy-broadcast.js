@@ -249,6 +249,8 @@ async function executeBroadcastTask(sock, groupData, textContent, mode, chat, is
     }
     const ghostNote = isGodcast ? `\n👻 Ghost Protocol: ON (forced reliability mode)` : '';
     await sock.sendMessage(chat, { text: `🌸 *ENGINE ENGAGED:* ${totalJobs} drops injected into Redis queue.${ghostNote}` });
+    // Nudge presence so WA server knows the socket is still alive after heavy queue injection
+    setTimeout(() => { sock.sendPresenceUpdate('available').catch(() => {}); }, 3000);
 }
 
 module.exports = {

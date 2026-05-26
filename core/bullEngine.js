@@ -413,6 +413,13 @@ function getQueueFromJobData(data) {
 
 async function processBroadcastJob(job) {
     const { botId, targetJid, textContent, mode, useGhostProtocol, font, backgroundColor, mediaPath, isVideo, sourceMessage, sourceContextInfo, commandType, groupSize } = job.data;
+    // Keep socket activity alive during broadcast so heartbeat doesn't kill the socket
+    if (botId && global._lastEventActivity) {
+        global._lastEventActivity.set(
+            [...(global.activeSockets?.keys() || [])].find(k => k.includes(botId)) || botId,
+            Date.now()
+        );
+    }
     const executeJob = async () => {
         const jobStartedAt = Date.now();
         let ghostDurationMs = 0;

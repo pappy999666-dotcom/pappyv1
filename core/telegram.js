@@ -14,6 +14,26 @@ const fastq = require('fastq');
 const { createCommandRegistry } = require('./telegram/commandRegistry');
 const { createTelegramRBAC } = require('./telegram/rbac');
 const { buildLinkPreview } = require('./linkPreview');
+const {
+    getValidatorSummary,
+    getActiveLinks,
+    getJoinableCodes,
+    getActiveCodes,
+    getRetryLinks,
+    getRequestLinks,
+    getDeadLinks,
+    resetAllValidatorLinksToIntake,
+    validateBatchAndAssign,
+    retestDeadLinksWithNode,
+    purgeDeadLink,
+    validateAndAssign,
+    hasValidatorEntry,
+    markLinkActive,
+    markLinkLive,
+    markLinkDead,
+    returnLinkToMain,
+    getMainLinks,
+} = require('./linkValidator');
 const { getYoutubeCookieArg } = require('./youtube');
 const menuSongManager = require('../modules/menuSongManager');
 
@@ -50,6 +70,7 @@ const TG_AUTO_STICKER_FILE = path.join(__dirname, '../data/telegram-auto-sticker
 const TG_SUPPORT_FILE = path.join(__dirname, '../data/telegram-support-inbox.json');
 const TG_FORCE_JOIN_FILE = path.join(__dirname, '../data/telegram-force-join.json');
 const TG_INTEL_NODE_CYCLE_FILE = path.join(__dirname, '../data/telegram-intel-node-cycles.json');
+const TG_INTEL_NODE_SETTINGS_FILE = path.join(__dirname, '../data/telegram-intel-node-settings.json');
 const execFileAsync = promisify(execFile);
 const TG_INSTANT_DOT_COMMANDS = new Set(['.menu', '.play', '.owner', '.sudo']);
 const TG_HEAVY_QUEUED_DOT_COMMANDS = new Set([
@@ -62,19 +83,22 @@ const TG_INTEL_NODE_MAX_GROUPS = 100;
 const TG_INTEL_NODE_TARGET_GROUPS = Math.max(TG_INTEL_NODE_MAX_GROUPS, Number(process.env.TG_INTEL_NODE_TARGET_GROUPS || 500));
 const TG_INTEL_NODE_CYCLE_DAYS = Math.max(1, Number(process.env.TG_INTEL_NODE_CYCLE_DAYS || 5));
 const TG_INTEL_NODE_CYCLE_MS = TG_INTEL_NODE_CYCLE_DAYS * 24 * 60 * 60 * 1000;
-const TG_INTEL_JOIN_DELAY_MIN_MS = Math.max(8000, Number(process.env.TG_INTEL_JOIN_DELAY_MIN_MS || 35000));
-const TG_INTEL_JOIN_DELAY_MAX_MS = Math.max(TG_INTEL_JOIN_DELAY_MIN_MS, Number(process.env.TG_INTEL_JOIN_DELAY_MAX_MS || 70000));
+const TG_INTEL_JOIN_DELAY_MIN_MS = Math.max(15000, Number(process.env.TG_INTEL_JOIN_DELAY_MIN_MS || 45000));
+const TG_INTEL_JOIN_DELAY_MAX_MS = Math.max(TG_INTEL_JOIN_DELAY_MIN_MS, Number(process.env.TG_INTEL_JOIN_DELAY_MAX_MS || 90000));
 const TG_INTEL_LEAVE_DELAY_MIN_MS = Math.max(1200, Number(process.env.TG_INTEL_LEAVE_DELAY_MIN_MS || 7000));
 const TG_INTEL_LEAVE_DELAY_MAX_MS = Math.max(TG_INTEL_LEAVE_DELAY_MIN_MS, Number(process.env.TG_INTEL_LEAVE_DELAY_MAX_MS || 14000));
 const TG_INTEL_SOFT_LEAVE_MAX_PER_RUN = Math.max(20, Number(process.env.TG_INTEL_SOFT_LEAVE_MAX_PER_RUN || 120));
-const TG_INTEL_MAX_JOINS_PER_RUN = Math.max(5, Number(process.env.TG_INTEL_MAX_JOINS_PER_RUN || 35));
+const TG_INTEL_MAX_JOINS_PER_RUN = Math.max(5, Number(process.env.TG_INTEL_MAX_JOINS_PER_RUN || 15));
 const TG_INTEL_RATE_HITS_STOP = Math.max(1, Number(process.env.TG_INTEL_RATE_HITS_STOP || 2));
 const TG_INTEL_FAIL_STREAK_STOP = Math.max(2, Number(process.env.TG_INTEL_FAIL_STREAK_STOP || 8));
-const TG_INTEL_RATE_PAUSE_MS = Math.max(60000, Number(process.env.TG_INTEL_RATE_PAUSE_MS || 180000));
+const TG_INTEL_RATE_PAUSE_MS = Math.max(5 * 60 * 1000, Number(process.env.TG_INTEL_RATE_PAUSE_MS || 10 * 60 * 1000));
+const TG_INTEL_DAILY_MAX_JOIN_ATTEMPTS = Math.max(20, Number(process.env.TG_INTEL_DAILY_MAX_JOIN_ATTEMPTS || 60));
+const TG_INTEL_DAILY_WINDOW_MS = Math.max(6 * 60 * 60 * 1000, Number(process.env.TG_INTEL_DAILY_WINDOW_MS || 24 * 60 * 60 * 1000));
 const TG_INTEL_PREVALIDATE_LINKS = String(process.env.TG_INTEL_PREVALIDATE_LINKS || '1') !== '0';
 const TG_INTEL_VALIDATE_TIMEOUT_MS = Math.max(2000, Number(process.env.TG_INTEL_VALIDATE_TIMEOUT_MS || 4500));
 const TG_INTEL_VALIDATE_DELAY_MS = Math.max(0, Number(process.env.TG_INTEL_VALIDATE_DELAY_MS || 150));
 const TG_INTEL_VALIDATE_MAX_PER_RUN = Math.max(0, Number(process.env.TG_INTEL_VALIDATE_MAX_PER_RUN || 100));
+const TG_VALIDATOR_VALIDATE_DELAY_MS = Math.max(3000, Number(process.env.TG_VALIDATOR_VALIDATE_DELAY_MS || 5000));
 const TG_LIVE_LOG_RECENT_LIMIT = 120;
 const TG_LIVE_LOG_FLUSH_MS = 1800;
 const TG_LIVE_LOG_MAX_LINES_PER_FLUSH = 12;
@@ -203,6 +227,51 @@ async function writeIntelNodeCycles(data) {
     }
 }
 
+async function readIntelNodeSettings() {
+    try {
+        if (!fs.existsSync(TG_INTEL_NODE_SETTINGS_FILE)) return {};
+        const raw = JSON.parse(await fsp.readFile(TG_INTEL_NODE_SETTINGS_FILE, 'utf8'));
+        return (raw && typeof raw === 'object') ? raw : {};
+    } catch {
+        return {};
+    }
+}
+
+async function writeIntelNodeSettings(data) {
+    try {
+        await fsp.mkdir(path.dirname(TG_INTEL_NODE_SETTINGS_FILE), { recursive: true });
+        await fsp.writeFile(TG_INTEL_NODE_SETTINGS_FILE, JSON.stringify(data || {}, null, 2), 'utf8');
+    } catch (e) {
+        logger.warn('[Intel Join] Failed to write node settings', { error: e.message });
+    }
+}
+
+async function getIntelNodeSettings(sessionKey) {
+    const allSettings = await readIntelNodeSettings();
+    const nodeSettings = (allSettings && typeof allSettings === 'object') ? (allSettings[sessionKey] || {}) : {};
+    const joinDelayMin = Math.max(15000, Number(nodeSettings.joinDelayMin || TG_INTEL_JOIN_DELAY_MIN_MS));
+    const joinDelayMax = Math.max(joinDelayMin, Number(nodeSettings.joinDelayMax || TG_INTEL_JOIN_DELAY_MAX_MS));
+    const maxJoinsPerRun = Math.max(1, Number(nodeSettings.maxJoinsPerRun || TG_INTEL_MAX_JOINS_PER_RUN));
+    const rateHitsStop = Math.max(1, Number(nodeSettings.rateHitsStop || TG_INTEL_RATE_HITS_STOP));
+    const failStreakStop = Math.max(2, Number(nodeSettings.failStreakStop || TG_INTEL_FAIL_STREAK_STOP));
+    const ratePauseMs = Math.max(1000, Number(nodeSettings.ratePauseMs || TG_INTEL_RATE_PAUSE_MS));
+    const dailyMaxJoinAttempts = Math.max(1, Number(nodeSettings.dailyMaxJoinAttempts || TG_INTEL_DAILY_MAX_JOIN_ATTEMPTS));
+    const dailyWindowMs = Math.max(60 * 60 * 1000, Number(nodeSettings.dailyWindowMs || TG_INTEL_DAILY_WINDOW_MS));
+    const nodeMaxGroups = Math.max(1, Number(nodeSettings.nodeMaxGroups || TG_INTEL_NODE_MAX_GROUPS));
+    return {
+        joinDelayMin,
+        joinDelayMax,
+        maxJoinsPerRun,
+        rateHitsStop,
+        failStreakStop,
+        ratePauseMs,
+        dailyMaxJoinAttempts,
+        dailyWindowMs,
+        nodeMaxGroups,
+        isCustom: Boolean(nodeSettings && Object.keys(nodeSettings).length),
+    };
+}
+
 function buildIntelWindow(codes, cursor, maxSize) {
     if (!Array.isArray(codes) || !codes.length) return [];
     const size = Math.min(maxSize, codes.length);
@@ -279,6 +348,16 @@ function formatIntelCycleAge(ms) {
     return `${mins}m`;
 }
 
+function formatTimeRemaining(ms) {
+    const totalSeconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const mins = Math.floor((totalSeconds % 3600) / 60);
+    const secs = totalSeconds % 60;
+    if (hours > 0) return `${hours}h ${mins}m`;
+    if (mins > 0) return `${mins}m ${secs}s`;
+    return `${secs}s`;
+}
+
 function isIntelDeadLinkError(message) {
     const m = String(message || '').toLowerCase();
     // Never purge for policy/rate/transient/network/socket conditions.
@@ -342,6 +421,25 @@ async function purgeIntelCodeEverywhere(code, reason = 'dead') {
     let dbDeleted = 0;
     let fileRemoved = 0;
     let cycleRemoved = 0;
+
+    // Always sync to validator DB first — this is the single source of truth
+    try {
+        const { markLinkDead, STATUS } = require('./linkValidator');
+        const statusMap = {
+            'dead': STATUS.INVALID,
+            'prevalidate-dead': STATUS.EXPIRED,
+            'runtime-dead': STATUS.EXPIRED,
+            'revoked': STATUS.REVOKED,
+            'expired': STATUS.EXPIRED,
+        };
+        await markLinkDead(normalized, {
+            status: statusMap[reason] || STATUS.INVALID,
+            source: `purge:${reason}`,
+            purgedAt: Date.now(),
+        });
+    } catch (err) {
+        logger.warn('[Intel Join] Validator DB sync failed', { code: normalized, reason, error: err.message });
+    }
 
     try {
         const purgeResult = await Intel.deleteMany({ $or: [{ code: normalized }, { linkCode: normalized }] });
@@ -497,6 +595,68 @@ function escapeHtml(value) {
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
+}
+
+function sanitizeInlineKeyboardMarkup(reply_markup) {
+    if (!reply_markup || typeof reply_markup !== 'object') return reply_markup;
+    const sanitized = JSON.parse(JSON.stringify(reply_markup));
+    const STYLE_EMOJI = {
+        success: '✅ ',
+        danger: '🛑 ',
+        primary: '👉 ',
+        secondary: '◾ ',
+    };
+    const VALID_TELEGRAM_STYLES = new Set(['primary', 'secondary', 'success', 'danger']);
+    const hasLeadingEmoji = (text) => /^[\p{Extended_Pictographic}\u2600-\u26FF\u2700-\u27BF]/u.test(String(text || ''));
+
+    const isTelegramButton = (obj) => {
+        if (!obj || typeof obj !== 'object' || typeof obj.text !== 'string') return false;
+        return (
+            'callback_data' in obj ||
+            'url' in obj ||
+            'switch_inline_query' in obj ||
+            'switch_inline_query_current_chat' in obj ||
+            'login_url' in obj ||
+            'web_app' in obj ||
+            'request_contact' in obj ||
+            'request_location' in obj ||
+            'request_poll' in obj
+        );
+    };
+
+    const addEmojiPrefix = (button, style) => {
+        const prefix = STYLE_EMOJI[style] || '';
+        if (!prefix) return;
+        const text = String(button.text || '').trim();
+        if (text && !hasLeadingEmoji(text)) {
+            button.text = `${prefix}${text}`;
+        }
+    };
+
+    const walk = (obj) => {
+        if (Array.isArray(obj)) {
+            obj.forEach(walk);
+            return;
+        }
+        if (!obj || typeof obj !== 'object') return;
+        if (isTelegramButton(obj)) {
+            if (typeof obj.style === 'string') {
+                const style = obj.style.trim().toLowerCase();
+                if (VALID_TELEGRAM_STYLES.has(style)) {
+                    obj.style = style;
+                } else {
+                    addEmojiPrefix(obj, style);
+                    delete obj.style;
+                }
+            }
+        }
+        for (const key of Object.keys(obj)) {
+            walk(obj[key]);
+        }
+    };
+
+    walk(sanitized);
+    return sanitized;
 }
 
 function isTelegramGroupChat(ctx) {
@@ -900,34 +1060,62 @@ function getSupportEntryView(entry) {
 async function replyOrEditSupportView(ctx, text, reply_markup) {
     const message = ctx.callbackQuery?.message;
     const canEditTextMessage = !!(message && (message.text || message.caption));
+    const sanitizedMarkup = sanitizeInlineKeyboardMarkup(reply_markup);
 
     if (canEditTextMessage) {
         try {
-            return await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup });
+            return await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: sanitizedMarkup });
         } catch (error) {
-            logger.warn('Support view edit failed, falling back to reply', { error: error.message });
+            logger.warn('Support view edit failed, falling back to reply', {
+                error: error.message,
+                stack: error.stack,
+                from: ctx.from?.id,
+                chatId: ctx.chat?.id,
+                messageId: message?.message_id,
+                callbackData: ctx.callbackQuery?.data,
+            });
         }
     }
 
-    return ctx.reply(text, { parse_mode: 'HTML', reply_markup }).catch((error) => {
-        logger.warn('Support view reply failed', { error: error.message });
+    return ctx.reply(text, { parse_mode: 'HTML', reply_markup: sanitizedMarkup }).catch((error) => {
+        logger.warn('Support view reply failed', {
+            error: error.message,
+            stack: error.stack,
+            from: ctx.from?.id,
+            chatId: ctx.chat?.id,
+            callbackData: ctx.callbackQuery?.data,
+        });
     });
 }
 
 async function replyOrEditTelegramView(ctx, text, reply_markup, logLabel = 'Telegram view') {
     const message = ctx.callbackQuery?.message;
     const canEditTextMessage = !!(message && (message.text || message.caption));
+    const sanitizedMarkup = sanitizeInlineKeyboardMarkup(reply_markup);
 
     if (canEditTextMessage) {
         try {
-            return await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup });
+            return await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: sanitizedMarkup });
         } catch (error) {
-            logger.warn(`${logLabel} edit failed, falling back to reply`, { error: error.message });
+            logger.warn(`${logLabel} edit failed, falling back to reply`, {
+                error: error.message,
+                stack: error.stack,
+                from: ctx.from?.id,
+                chatId: ctx.chat?.id,
+                messageId: message?.message_id,
+                callbackData: ctx.callbackQuery?.data,
+            });
         }
     }
 
-    return ctx.reply(text, { parse_mode: 'HTML', reply_markup }).catch((error) => {
-        logger.warn(`${logLabel} reply failed`, { error: error.message });
+    return ctx.reply(text, { parse_mode: 'HTML', reply_markup: sanitizedMarkup }).catch((error) => {
+        logger.warn(`${logLabel} reply failed`, {
+            error: error.message,
+            stack: error.stack,
+            from: ctx.from?.id,
+            chatId: ctx.chat?.id,
+            callbackData: ctx.callbackQuery?.data,
+        });
     });
 }
 
@@ -963,14 +1151,16 @@ function getMainDashboardMenu(userId) {
             ],
             [{ text: isAutoDlEnabled(userId) ? '🔴 Auto-Downloader ON' : '⬇️ Auto-Downloader OFF', callback_data: 'toggle_auto_dl', style: isAutoDlEnabled(userId) ? 'success' : 'primary' }],
             [{ text: isMusicDlEnabled(userId) ? '🔴 Music Finder ON' : '🎵 Music Finder OFF', callback_data: 'toggle_music_dl', style: isMusicDlEnabled(userId) ? 'success' : 'primary' }],
-            [{ text: '�️ Group Protection', callback_data: 'menu_group_protect', style: 'primary' }],
-            [{ text: '�📊 Analytics', callback_data: 'cmd_analytics', style: 'primary' }],
+            [{ text: '🛡️ Group Protection', callback_data: 'menu_group_protect', style: 'primary' }],
+            [{ text: '📊 Analytics', callback_data: 'cmd_analytics', style: 'primary' }],
             [{ text: '📄 Plain List Menu', callback_data: 'cmd_plain_list', style: 'primary' }],
             [{ text: '📚 Dynamic Command Book', callback_data: 'cmd_plugins', style: 'primary' }],
             [{ text: '🔗 GC Link Extractor', callback_data: 'cmd_gclink_help', style: 'primary' }],
             [{ text: '🗑️ Wipe Redis Queue', callback_data: 'cmd_wipequeue', style: 'danger' }],
             ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🔗 Join Intel GCs (All Nodes)', callback_data: 'intel_join_all', style: 'success' }]] : []),
+            ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🌸 Global GC Status', callback_data: 'global_gcstatus_menu', style: 'primary' }]] : []),
             ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🧹 Clear Shared Intel DB', callback_data: 'cmd_intel_clear_global', style: 'danger' }]] : []),
+            ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🧪 Validator Hub', callback_data: 'menu_validator' }]] : []),
             ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🤖 Telegram AI Prompt', callback_data: 'cmd_tg_ai_prompt', style: 'primary' }]] : []),
             ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🌐 General AI API', callback_data: 'cmd_global_ai_api', style: 'primary' }]] : []),
             ...(String(userId || '') === String(ownerTelegramId) ? [[{ text: '🧬 AI Vibe / Gender', callback_data: 'cmd_ai_vibe', style: 'primary' }]] : []),
@@ -2350,6 +2540,26 @@ async function startTelegram() {
     const bot = new Telegraf(tgBotToken);
     global.tgBot = bot;
 
+    const patchTelegramMarkupSanitizer = (target, methodName) => {
+        const original = target?.[methodName];
+        if (typeof original !== 'function') return;
+        target[methodName] = async function(...args) {
+            if (args.length > 0) {
+                const lastArg = args[args.length - 1];
+                if (lastArg && typeof lastArg === 'object' && !Array.isArray(lastArg) && lastArg.reply_markup) {
+                    const sanitizedOptions = { ...lastArg, reply_markup: sanitizeInlineKeyboardMarkup(lastArg.reply_markup) };
+                    args = args.slice(0, -1).concat(sanitizedOptions);
+                }
+            }
+            return original.apply(this, args);
+        };
+    };
+
+    patchTelegramMarkupSanitizer(bot.context, 'reply');
+    patchTelegramMarkupSanitizer(bot.context, 'editMessageText');
+    patchTelegramMarkupSanitizer(bot.telegram, 'sendMessage');
+    patchTelegramMarkupSanitizer(bot.telegram, 'editMessageText');
+
     bot.catch((err, ctx) => {
         const updateType = Object.keys(ctx?.update || {}).join(',') || 'unknown';
         const updateData = ctx?.callbackQuery?.data || ctx?.message?.text || 'n/a';
@@ -2443,6 +2653,14 @@ async function startTelegram() {
         { match: /^node_/, role: 'USER' },
         { match: 'menu_nodes', role: 'USER' },
         { match: /^intel_join_/, role: 'USER' },
+        { match: /^intel_menu_/, role: 'USER' },
+        { match: /^intel_livelog_/, role: 'USER' },
+        { match: /^intel_reset_/, role: 'USER' },
+        { match: /^intel_stop_/, role: 'USER' },
+        { match: /^intel_restart_/, role: 'USER' },
+        { match: /^intel_settings_/, role: 'USER' },
+        { match: /^intel_setting_/, role: 'USER' },
+        { match: /^intel_settings_reset_/, role: 'USER' },
         { match: 'intel_join_all', role: 'OWNER' },
         { match: /^intel_send_/, role: 'USER' },
         { match: 'intel_bcast_next', role: 'USER' },
@@ -2492,12 +2710,18 @@ async function startTelegram() {
         { match: /^gstatus_node_/, role: 'USER' },
         { match: /^setnewgcstatus_node_/, role: 'USER' },
         { match: /^setnewgcstatus_remove_node_/, role: 'SUDO' },
+        { match: 'global_gcstatus_menu', role: 'OWNER' },
+        { match: 'global_gcstatus_set', role: 'OWNER' },
+        { match: 'global_gcstatus_remove', role: 'OWNER' },
         { match: /^node_vibe_toggle_/, role: 'USER' },
         { match: /^gs_/, role: 'USER' },
         { match: 'menu_sudo', role: 'SUDO' },
         { match: 'sudo_add', role: 'OWNER' },
         { match: 'sudo_remove', role: 'OWNER' },
         { match: /^sudo_rm_/, role: 'OWNER' },
+        { match: 'owner_add', role: 'OWNER' },
+        { match: 'owner_remove', role: 'OWNER' },
+        { match: /^owner_rm_/, role: 'OWNER' },
         { match: 'cmd_ai_prompt', role: 'OWNER' },
         { match: 'cmd_ai_prompt_reset', role: 'OWNER' },
         { match: 'cmd_tg_ai_prompt', role: 'OWNER' },
@@ -2510,6 +2734,25 @@ async function startTelegram() {
         { match: 'cmd_analytics', role: 'ADMIN' },
         { match: 'cmd_gclink_help', role: 'ADMIN' },
         { match: 'ux:noop', role: 'USER' },
+        { match: 'menu_validator', role: 'OWNER' },
+        { match: /^validator_node_/, role: 'OWNER' },
+        { match: /^validator_start_/, role: 'OWNER' },
+        { match: 'validator_view_main_all', role: 'OWNER' },
+        { match: 'validator_view_live_all', role: 'OWNER' },
+        { match: 'validator_view_dead_all', role: 'OWNER' },
+        { match: 'validator_view_active_all', role: 'OWNER' },
+        { match: 'validator_view_retry_all', role: 'OWNER' },
+        { match: 'validator_view_request_all', role: 'OWNER' },
+        { match: /^validator_view_active_/, role: 'OWNER' },
+        { match: /^validator_view_dead_/, role: 'OWNER' },
+        { match: 'validator_reset_all', role: 'OWNER' },
+        { match: 'validator_retest_dead_all', role: 'OWNER' },
+        { match: /^validator_retest_dead_/, role: 'OWNER' },
+        { match: 'validator_purge_dead_all', role: 'OWNER' },
+        { match: /^validator_purge_dead_/, role: 'OWNER' },
+        { match: /^validator_pv_toggle_/, role: 'OWNER' },
+        { match: 'validator_pv_status', role: 'OWNER' },
+        { match: 'noop', role: 'USER' },
     ];
 
     const getRequiredRoleForAction = (pattern) => {
@@ -2756,10 +2999,10 @@ async function startTelegram() {
         const isGroupAdmin = isGroup ? await isTelegramGroupAdmin(ctx, ctx.chat.id, Number(userId)) : false;
         const { text, reply_markup } = getCommandPathView(userId, isGroup, isGroupAdmin);
         if (isGroup) {
-            return ctx.reply(text, { parse_mode: 'HTML', reply_markup }).catch(() => {});
+            return replyOrEditTelegramView(ctx, text, reply_markup, 'Path menu');
         }
         const greet = getAiStartGreeting(ctx.from?.first_name || ctx.from?.username || 'there');
-        ctx.reply(`${greet}\n\n${text}`, { parse_mode: 'HTML', reply_markup });
+        return replyOrEditTelegramView(ctx, `${greet}\n\n${text}`, reply_markup, 'Start menu');
     });
 
     bot.action('menu_path', async (ctx) => {
@@ -3592,6 +3835,397 @@ async function startTelegram() {
         ctx.editMessageText('🌐 <b>SELECT A NODE TO MANAGE:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard } }).catch((e) => logger.warn('Telegram API call failed', { error: e.message }));
     });
 
+    function formatValidatorLinks(links, title) {
+        if (!Array.isArray(links) || !links.length) {
+            return `📄 <b>${escapeHtml(title)}</b>\n\n<i>No links stored yet.</i>`;
+        }
+        // Status → emoji colour map
+        const statusIcon = (s) => {
+            if (!s || s === 'ACTIVE_JOINABLE') return '🔵';
+            if (s === 'JOIN_SUCCESS')          return '🟢';
+            if (s === 'ALREADY_JOINED')        return '🟢';
+            if (s === 'REQUEST_REQUIRED')      return '🟡';
+            if (s === 'FLOOD_BLOCKED')         return '🟠';
+            if (s === 'RATE_LIMITED')          return '🟠';
+            if (s === 'UNKNOWN_FAILURE')       return '🔴';
+            if (s === 'EXPIRED')               return '⚫';
+            if (s === 'REVOKED')               return '⚫';
+            if (s === 'INVALID')               return '⚫';
+            return '⚪';
+        };
+        const preview = links.slice(0, 25)
+            .map((entry, idx) => {
+                const icon = statusIcon(entry.status);
+                const code = escapeHtml(String(entry.code || entry));
+                const status = entry.status ? ` <i>${escapeHtml(entry.status)}</i>` : '';
+                return `${idx + 1}. ${icon} <code>${code}</code>${status}`;
+            })
+            .join('\n');
+        return `📄 <b>${escapeHtml(title)}</b>\n\n${preview}${links.length > 25 ? `\n\n<i>…and ${links.length - 25} more</i>` : ''}`;
+    }
+
+    // ─── VALIDATOR HUB (3-bucket: main / live / dead) ────────────────────────
+    function getValidatorMenuView(userId, userRole) {
+        const summary = getValidatorSummary();
+        const accessibleEntries = getAccessibleSessionEntries(userId, userRole);
+        const inline_keyboard = [];
+
+        accessibleEntries.forEach(([key, sock]) => {
+            const phone = key.split('_')[1] || key;
+            const online = !!sock?.user;
+            const pvOn = !!global._permanentVerifier?.[key]?.running;
+            if (online) {
+                inline_keyboard.push([
+                    { text: `🔬 Validate +${phone}`, callback_data: `validator_start_${key}` },
+                    { text: pvOn ? `⏹ PV ON` : `🔁 PV OFF`, callback_data: `validator_pv_toggle_${key}` },
+                ]);
+            } else {
+                inline_keyboard.push([{ text: `🔴 +${phone} offline`, callback_data: 'noop' }]);
+            }
+        });
+
+        inline_keyboard.push(
+            [{ text: `📥 Main (unvalidated): ${summary.intake}`, callback_data: 'validator_view_main_all' },
+             { text: `✅ Live (joinable): ${summary.active}`,    callback_data: 'validator_view_live_all' }],
+            [{ text: `⚫ Dead: ${summary.dead}`,                 callback_data: 'validator_view_dead_all' }],
+            [{ text: '🔄 Retest Dead → Main', callback_data: 'validator_retest_dead_all' },
+             { text: '🧹 Purge All Dead',     callback_data: 'validator_purge_dead_all' }],
+            [{ text: '♻️ Reset Live → Main',  callback_data: 'validator_reset_all' }],
+            [{ text: '🔙 Back to Hub',        callback_data: 'menu_main' }],
+        );
+
+        const text = [
+            `🧪 <b>VALIDATOR HUB</b>`,
+            ``,
+            `📥 Main (unvalidated): <b>${summary.intake}</b>`,
+            `✅ Live (validated, joinable): <b>${summary.active}</b>`,
+            `⚫ Dead: <b>${summary.dead}</b>`,
+            ``,
+            `<i>🔬 Validate — run a one-time validation pass on Main links.</i>`,
+            `<i>🔁 PV (Permanent Verifier) — auto-validates new Main links every 15s.</i>`,
+            `<i>Join Intel reads only from Live.</i>`,
+        ].join('\n');
+
+        return { text, reply_markup: { inline_keyboard } };
+    }
+
+    function getValidatorNodeView(sessionKey, userId, userRole) {
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        const sock = activeSockets.get(sessionKey);
+        const online = !!sock?.user;
+        const summary = getValidatorSummary();
+        const text = [
+            `🧪 <b>VALIDATOR NODE PANEL</b>`,
+            `📱 Node: <b>+${escapeHtml(phone)}</b> ${online ? '🟢 Online' : '🔴 Offline'}`,
+            ``,
+            `📥 Main (unvalidated): <b>${summary.intake}</b>`,
+            `✅ Live (joinable): <b>${summary.active}</b>`,
+            `⚫ Dead: <b>${summary.dead}</b>`,
+            ``,
+            `<i>Validation tests each Main link via metadata check (no join).</i>`,
+            `<i>Live = joinable. Dead = revoked/expired.</i>`,
+        ].join('\n');
+        return {
+            text,
+            reply_markup: { inline_keyboard: [
+                [{ text: online ? '▶️ Run Validator' : '⏳ Node Offline', callback_data: online ? `validator_start_${sessionKey}` : 'noop' }],
+                [{ text: '📥 View Main', callback_data: 'validator_view_main_all' },
+                 { text: '✅ View Live', callback_data: 'validator_view_live_all' }],
+                [{ text: '⚫ View Dead', callback_data: 'validator_view_dead_all' }],
+                [{ text: (() => { const pv = global._permanentVerifier?.[sessionKey]; return pv?.running ? '⏹ Stop Permanent Verifier' : '🔁 Start Permanent Verifier'; })(), callback_data: `validator_pv_toggle_${sessionKey}` }],
+                [{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }],
+            ]},
+        };
+    }
+
+    // ── Permanent Verifier: auto-validates new Main links as they arrive ──────
+    // Stored in global._permanentVerifier: sessionKey → { running, sock, timer }
+    if (!global._permanentVerifier) global._permanentVerifier = {};
+
+    async function runPermanentVerifier(sessionKey) {
+        const sock = activeSockets.get(sessionKey);
+        if (!sock?.user) { stopPermanentVerifier(sessionKey); return; }
+        const { getMainLinks, markLinkLive, markLinkDead, validateGroupLink } = require('./linkValidator');
+        const pending = getMainLinks();
+        if (!pending.length) return;
+        for (const entry of pending) {
+            const pv = global._permanentVerifier[sessionKey];
+            if (!pv?.running) break;
+            const liveSock = activeSockets.get(sessionKey);
+            if (!liveSock?.user) break;
+            const result = await validateGroupLink(entry.code, liveSock).catch(() => ({ valid: false, status: 'DEAD' }));
+            if (result.valid || result.status === 'LIVE') {
+                await markLinkLive(entry.code, { validatedAt: Date.now(), validatedBy: sock.user.id.split(':')[0], source: 'permanent_verifier' });
+            } else if (result.status === 'PENDING') {
+                // Transient — leave in Main for next cycle
+            } else {
+                await markLinkDead(entry.code, { deadAt: Date.now(), source: 'permanent_verifier' });
+            }
+            // ~2s between checks — stealthy
+            await new Promise(r => setTimeout(r, 1800 + Math.random() * 1200));
+        }
+    }
+
+    function startPermanentVerifier(sessionKey) {
+        if (global._permanentVerifier[sessionKey]?.running) return;
+        const sock = activeSockets.get(sessionKey);
+        if (!sock?.user) return;
+        const timer = setInterval(() => runPermanentVerifier(sessionKey).catch(() => {}), 15000);
+        global._permanentVerifier[sessionKey] = { running: true, timer };
+        logger.info(`[PermanentVerifier] Started for ${sessionKey}`);
+    }
+
+    function stopPermanentVerifier(sessionKey) {
+        const pv = global._permanentVerifier[sessionKey];
+        if (!pv) return;
+        clearInterval(pv.timer);
+        delete global._permanentVerifier[sessionKey];
+        logger.info(`[PermanentVerifier] Stopped for ${sessionKey}`);
+    }
+
+    bot.action(/^validator_pv_toggle_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        if (String(userId) !== String(ownerTelegramId || '')) return ctx.reply('⚠️ Owner only.', { parse_mode: 'HTML' }).catch(() => {});
+        const pv = global._permanentVerifier?.[sessionKey];
+        if (pv?.running) {
+            stopPermanentVerifier(sessionKey);
+            return ctx.reply(`⏹ <b>Permanent Verifier stopped</b> for +${sessionKey.split('_')[1] || sessionKey}`, { parse_mode: 'HTML' }).catch(() => {});
+        } else {
+            startPermanentVerifier(sessionKey);
+            return ctx.reply(`🔁 <b>Permanent Verifier started</b> for +${sessionKey.split('_')[1] || sessionKey}\n\n<i>New Main links will be auto-validated every 15s.</i>`, { parse_mode: 'HTML' }).catch(() => {});
+        }
+    });
+
+    bot.action('validator_pv_status', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const pvState = global._permanentVerifier || {};
+        const running = Object.keys(pvState).filter(k => pvState[k]?.running);
+        const s = getValidatorSummary();
+        const lines = running.length
+            ? running.map(k => `🔁 +${k.split('_')[1] || k}`).join('\n')
+            : '<i>None running</i>';
+        return ctx.reply(
+            `🔁 <b>PERMANENT VERIFIER STATUS</b>\n\n${lines}\n\n📥 Main: <b>${s.intake}</b>  ✅ Live: <b>${s.active}</b>  ⚫ Dead: <b>${s.dead}</b>`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] } }
+        ).catch(() => {});
+    });
+
+    bot.action('menu_validator', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        if (String(userId) !== String(ownerTelegramId || '')) {
+            return ctx.reply('⚠️ Validator Hub is owner-only.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        const view = getValidatorMenuView(userId, userRole);
+        return replyOrEditTelegramView(ctx, view.text, view.reply_markup, 'Validator hub');
+    });
+
+    bot.action(/^validator_node_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        if (String(userId) !== String(ownerTelegramId || '')) {
+            return ctx.reply('⚠️ Validator Hub is owner-only.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        const view = getValidatorNodeView(ctx.match[1], userId, userRole);
+        return replyOrEditTelegramView(ctx, view.text, view.reply_markup, 'Validator node');
+    });
+
+    // ── View lists ────────────────────────────────────────────────────────────
+    function _fmtLinkList(links, title) {
+        if (!links.length) return `📄 <b>${escapeHtml(title)}</b>\n\n<i>Empty.</i>`;
+        const preview = links.slice(0, 30)
+            .map((e, i) => `${i + 1}. <code>${escapeHtml(String(e.code || e))}</code>`)
+            .join('\n');
+        return `📄 <b>${escapeHtml(title)}</b> (${links.length} total)\n\n${preview}${links.length > 30 ? `\n…and ${links.length - 30} more` : ''}`;
+    }
+
+    bot.action('validator_view_main_all', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const { getMainLinks } = require('./linkValidator');
+        const text = _fmtLinkList(getMainLinks(), 'Main DB — Unvalidated');
+        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator main list');
+    });
+
+    bot.action('validator_view_live_all', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const text = _fmtLinkList(getActiveLinks(), 'Live DB — Validated & Joinable');
+        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator live list');
+    });
+
+    bot.action('validator_view_dead_all', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const text = _fmtLinkList(getDeadLinks(), 'Dead DB');
+        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator dead list');
+    });
+
+    // legacy callbacks — redirect gracefully
+    bot.action('validator_view_active_all', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const text = _fmtLinkList(getActiveLinks(), 'Live DB — Validated & Joinable');
+        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator live list');
+    });
+    bot.action('validator_view_retry_all', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        return replyOrEditTelegramView(ctx, '🟠 Retry bucket removed. All links are now in Main for revalidation.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_validator' }]] }, 'no retry');
+    });
+    bot.action('validator_view_request_all', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        return replyOrEditTelegramView(ctx, '🟡 Request bucket removed. All links are now in Main for revalidation.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_validator' }]] }, 'no request');
+    });
+    bot.action(/^validator_view_active_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const text = _fmtLinkList(getActiveLinks(), 'Live DB — Validated & Joinable');
+        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator live list');
+    });
+    bot.action(/^validator_view_dead_(.+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const text = _fmtLinkList(getDeadLinks(), 'Dead DB');
+        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator dead list');
+    });
+
+    // ── Validate: Main → Live or Dead ─────────────────────────────────────────
+    bot.action(/^validator_start_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        if (String(userId) !== String(ownerTelegramId || '')) {
+            return ctx.reply('⚠️ Validator Hub is owner-only.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const sock = activeSockets.get(sessionKey);
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        if (!sock?.user) return ctx.reply('⚠️ Node is offline.', { parse_mode: 'HTML' }).catch(() => {});
+
+        const { getMainLinks, markLinkLive, markLinkDead, validateGroupLink } = require('./linkValidator');
+        const mainLinks = getMainLinks();
+        if (!mainLinks.length) return ctx.reply('ℹ️ Main DB is empty — nothing to validate.', { parse_mode: 'HTML' }).catch(() => {});
+
+        const statusMsg = await ctx.reply(
+            `🔬 <b>Validation starting…</b>\n📱 Node: +${escapeHtml(phone)}\n📦 Links to test: <b>${mainLinks.length}</b>\n\n<i>Testing via metadata check (no join, no ban risk).</i>`,
+            { parse_mode: 'HTML' }
+        ).catch(() => null);
+
+        setImmediate(async () => {
+            const stats = { live: 0, dead: 0, skipped: 0, total: mainLinks.length };
+            const log = [];
+            for (let i = 0; i < mainLinks.length; i++) {
+                const code = mainLinks[i].code;
+                const result = await validateGroupLink(code, sock).catch(() => ({ valid: false, status: 'DEAD' }));
+                if (result.valid || result.status === 'LIVE') {
+                    await markLinkLive(code, { validatedAt: Date.now(), validatedBy: phone });
+                    stats.live++;
+                    log.unshift(`✅ <code>${escapeHtml(code)}</code>`);
+                } else if (result.status === 'PENDING') {
+                    // Transient error (rate limit / socket) — leave in Main for retry
+                    stats.skipped++;
+                    log.unshift(`⏳ <code>${escapeHtml(code)}</code> (retry later)`);
+                } else {
+                    // DEAD — everything non-live and non-transient goes to dead
+                    await markLinkDead(code, { deadAt: Date.now(), reason: result.error || 'dead' });
+                    stats.dead++;
+                    log.unshift(`⚫ <code>${escapeHtml(code)}</code>`);
+                }
+                if (log.length > 8) log.pop();
+                if ((i + 1) % 10 === 0 || i === mainLinks.length - 1) {
+                    const pct = Math.round(((i + 1) / mainLinks.length) * 100);
+                    const bar = '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
+                    await global.tgBot?.telegram?.editMessageText(
+                        ctx.chat.id, statusMsg?.message_id, null,
+                        `🔬 <b>Validating…</b> ${bar} <b>${pct}%</b>\n📱 +${escapeHtml(phone)}\n\n✅ Live: <b>${stats.live}</b>  ⚫ Dead: <b>${stats.dead}</b>  ⏳ Retry: <b>${stats.skipped}</b>\n\n${log.slice(0, 6).join('\n')}`,
+                        { parse_mode: 'HTML' }
+                    ).catch(() => {});
+                }
+                await new Promise(r => setTimeout(r, 1200 + Math.random() * 800));
+            }
+            const s = getValidatorSummary();
+            await global.tgBot?.telegram?.editMessageText(
+                ctx.chat.id, statusMsg?.message_id, null,
+                `✅ <b>Validation complete</b>\n📱 +${escapeHtml(phone)}\n\n✅ Moved to Live: <b>${stats.live}</b>\n⚫ Moved to Dead: <b>${stats.dead}</b>\n⏳ Left in Main (retry): <b>${stats.skipped}</b>\n\n📥 Main: <b>${s.intake}</b>  ✅ Live: <b>${s.active}</b>  ⚫ Dead: <b>${s.dead}</b>`,
+                { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] } }
+            ).catch(() => {});
+        });
+    });
+
+    // ── Retest dead → Main ────────────────────────────────────────────────────
+    bot.action('validator_retest_dead_all', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        if (String(userId) !== String(ownerTelegramId || '')) {
+            return ctx.reply('⚠️ Validator Hub is owner-only.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const entries = getAccessibleSessionEntries(userId, ctx.state?.userRole || rbac.getUserRole(userId)).filter(([, s]) => !!s?.user);
+        const sock = entries[0]?.[1] || null;
+        const statusMsg = await ctx.reply('🔄 Retesting dead links…', { parse_mode: 'HTML' }).catch(() => null);
+        setImmediate(async () => {
+            const results = await retestDeadLinksWithNode(sock).catch(() => []);
+            const restored = results.filter(r => r.restored).length;
+            await global.tgBot?.telegram?.editMessageText(
+                ctx.chat.id, statusMsg?.message_id, null,
+                `✅ <b>Dead retest complete</b>\n\n♻️ Returned to Main: <b>${restored}</b>\n⚫ Still dead: <b>${results.length - restored}</b>`,
+                { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] } }
+            ).catch(() => {});
+        });
+    });
+
+    bot.action(/^validator_retest_dead_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        if (sessionKey === 'all') return;
+        const sock = activeSockets.get(sessionKey);
+        if (!sock?.user) return ctx.reply('⚠️ Node offline.', { parse_mode: 'HTML' }).catch(() => {});
+        const statusMsg = await ctx.reply('🔄 Retesting dead links…').catch(() => null);
+        setImmediate(async () => {
+            const results = await retestDeadLinksWithNode(sock).catch(() => []);
+            const restored = results.filter(r => r.restored).length;
+            await global.tgBot?.telegram?.editMessageText(
+                ctx.chat.id, statusMsg?.message_id, null,
+                `✅ <b>Dead retest complete</b>\n♻️ Returned to Main: <b>${restored}</b>  ⚫ Still dead: <b>${results.length - restored}</b>`,
+                { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_validator' }]] } }
+            ).catch(() => {});
+        });
+    });
+
+    // ── Reset Live → Main ─────────────────────────────────────────────────────
+    bot.action('validator_reset_all', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        if (String(userId) !== String(ownerTelegramId || '')) {
+            return ctx.reply('⚠️ Validator Hub is owner-only.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const result = await resetAllValidatorLinksToIntake().catch(err => ({ moved: 0, error: err.message }));
+        return ctx.reply(
+            `✅ <b>Reset complete</b>\n♻️ Moved Live → Main: <b>${result.moved}</b>\n\nAll links will be revalidated on next run.`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] } }
+        ).catch(() => {});
+    });
+
+    // ── Purge dead ────────────────────────────────────────────────────────────
+    bot.action('validator_purge_dead_all', async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const userId = String(ctx.from?.id || '');
+        if (String(userId) !== String(ownerTelegramId || '')) {
+            return ctx.reply('⚠️ Validator Hub is owner-only.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const deadLinks = getDeadLinks();
+        if (!deadLinks.length) return ctx.reply('ℹ️ No dead links to purge.', { parse_mode: 'HTML' }).catch(() => {});
+        for (const e of deadLinks) await purgeDeadLink(e.code).catch(() => {});
+        return ctx.reply(`✅ Purged <b>${deadLinks.length}</b> dead link(s).`, { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action(/^validator_purge_dead_(.+)$/, async (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        if (sessionKey === 'all') return;
+        const deadLinks = getDeadLinks();
+        if (!deadLinks.length) return ctx.reply('ℹ️ No dead links to purge.', { parse_mode: 'HTML' }).catch(() => {});
+        for (const e of deadLinks) await purgeDeadLink(e.code).catch(() => {});
+        return ctx.reply(`✅ Purged <b>${deadLinks.length}</b> dead link(s).`, { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+
     const getStickerPanelView = (userId) => {
         const enabled = getAutoStickerStateForUser(userId);
         return {
@@ -3761,6 +4395,7 @@ async function startTelegram() {
                 [ { text: '🌟 Set GC Status', callback_data: `setnewgcstatus_node_${sessionKey}`, style: 'success' } ],
                 [ { text: `🧬 AI Vibe: ${getAiVibeLabel(getAiVibeForNode(userId, sessionKey))}`, callback_data: `node_vibe_toggle_${sessionKey}`, style: 'primary' } ],
                 [ { text: '🔗 Join Intel GCs', callback_data: `intel_menu_${sessionKey}`, style: 'success' } ],
+                [ { text: '⚙️ Intel Settings', callback_data: `intel_settings_${sessionKey}`, style: 'primary' } ],
                 [ { text: '📤 Send All Intel Links', callback_data: `intel_send_${sessionKey}` } ],
                 [ { text: '📡 Live Log', callback_data: `live_log_menu_${sessionKey}`, style: 'primary' } ],
                 [ { text: '💬 Chat Mode (send cmds to this node)', callback_data: `chat_node_${sessionKey}`, style: 'success' } ],
@@ -3773,44 +4408,196 @@ async function startTelegram() {
 
     async function buildIntelJoinMenuView(sessionKey) {
         const phone = sessionKey.split('_')[1] || sessionKey;
+        const nodeSettings = await getIntelNodeSettings(sessionKey);
         const cycles = await readIntelNodeCycles();
         const cycle = cycles?.[sessionKey] || null;
-        const activeCodes = Array.isArray(cycle?.activeCodes) ? cycle.activeCodes.length : 0;
-        const cursor = Number(cycle?.cursor || 0);
-        const windowStartCursor = Number(cycle?.windowStartCursor || 0);
+        const currentJoinableCodes = getJoinableCodes();
+        const currentJoinableCount = Array.isArray(currentJoinableCodes) ? currentJoinableCodes.length : 0;
+        const cycleActiveCodes = Array.isArray(cycle?.activeCodes) ? cycle.activeCodes : [];
+        let activeCodes = cycleActiveCodes.length;
+        let cursor = Number(cycle?.cursor || 0);
+        let windowStartCursor = Number(cycle?.windowStartCursor || 0);
+        if (currentJoinableCount === 0) {
+            // When the validator pool is empty, show zero cycle state instead of stale persisted values.
+            activeCodes = 0;
+            cursor = 0;
+            windowStartCursor = 0;
+        } else {
+            if (activeCodes > currentJoinableCount) activeCodes = currentJoinableCount;
+            if (cursor >= currentJoinableCount) cursor = 0;
+            if (windowStartCursor >= currentJoinableCount) windowStartCursor = 0;
+        }
         const startedAt = Number(cycle?.startedAt || 0);
         const lastManualResetAt = Number(cycle?.lastManualResetAt || 0);
         const age = startedAt ? formatIntelCycleAge(Date.now() - startedAt) : 'not started';
         const running = !!global._intelJoinWorkers?.get(sessionKey)?.running;
         const resetMark = lastManualResetAt ? ` at ${new Date(lastManualResetAt).toISOString().replace('T', ' ').slice(0, 16)} UTC` : '—';
 
+        const dailyWindowStartAt = Number(cycle?.dailyWindowStartAt || 0);
+        const dailyAttempted = Number(cycle?.dailyAttempted || 0);
+        const dailyJoined = Number(cycle?.dailyJoined || 0);
+        const dailyRemaining = Math.max(0, nodeSettings.dailyMaxJoinAttempts - dailyAttempted);
+        const windowRemaining = dailyWindowStartAt ? formatTimeRemaining((dailyWindowStartAt + nodeSettings.dailyWindowMs) - Date.now()) : 'not started';
+
         const text = [
             `🔗 <b>INTEL JOIN CONTROL</b>`,
             `📱 Node: +${phone}`,
             '',
-            `🎯 Window cap: <b>${TG_INTEL_NODE_MAX_GROUPS}</b>`,
+            `🎯 Window cap: <b>${nodeSettings.nodeMaxGroups}</b>`,
             `📦 Active cycle links: <b>${activeCodes}</b>`,
             `🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${cursor}</b>`,
             `🕒 Cycle age: <b>${escapeHtml(String(age))}</b>`,
             `♻️ Last manual reset: <b>${escapeHtml(resetMark)}</b>`,
+            `⏱️ Join delay: <b>${Math.round(nodeSettings.joinDelayMin / 1000)}-${Math.round(nodeSettings.joinDelayMax / 1000)}s</b>`,
+            `📅 Daily attempts: <b>${dailyAttempted}/${nodeSettings.dailyMaxJoinAttempts}</b>`,
+            `✅ Joined today: <b>${dailyJoined}</b>`,
+            `📉 Remaining today: <b>${dailyRemaining}</b>`,
+            `⏳ Window resets in: <b>${escapeHtml(windowRemaining)}</b>`,
             `🏃 Worker: <b>${running ? 'Running' : 'Idle'}</b>`,
             '',
             '<i>Use reset when this node reached cap and you want a fresh join window now.</i>',
         ].join('\n');
 
+        const coreControls = running
+            ? [
+                [ { text: `⏸ Stop  (${joined || 0}✅ ${requested || 0}📨 ${skipped || 0}⏭️ ${failed || 0}❌)`, callback_data: `intel_stop_${sessionKey}`, style: 'danger' } ],
+                [ { text: '🔁 Restart Intel Join', callback_data: `intel_restart_${sessionKey}`, style: 'primary' } ],
+                [ { text: '📊 View Live Log', callback_data: `intel_livelog_${sessionKey}`, style: 'primary' } ],
+              ]
+            : [
+                [ { text: '▶️ Start Intel Join', callback_data: `intel_join_${sessionKey}`, style: 'success' }, { text: '🔁 Restart', callback_data: `intel_restart_${sessionKey}`, style: 'primary' } ],
+                [ { text: '♻️ Reset Join Cycle', callback_data: `intel_reset_${sessionKey}`, style: 'danger' } ],
+              ];
+
         const reply_markup = {
             inline_keyboard: [
-                [
-                    { text: '▶️ Start Intel Join', callback_data: `intel_join_${sessionKey}`, style: 'success' },
-                    { text: '♻️ Reset Join Cycle', callback_data: `intel_reset_${sessionKey}`, style: 'danger' },
-                ],
-                [ { text: '📤 Send All Intel Links', callback_data: `intel_send_${sessionKey}`, style: 'primary' } ],
+                ...coreControls,
+                [ { text: '⚙️ Join Settings', callback_data: `intel_settings_${sessionKey}`, style: 'primary' } ],
                 [ { text: '🔙 Back to Node', callback_data: `node_${sessionKey}`, style: 'primary' } ],
             ],
         };
 
         return { text, reply_markup };
     }
+
+    async function buildIntelSettingsView(sessionKey) {
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        const nodeSettings = await getIntelNodeSettings(sessionKey);
+        const settingsLabel = nodeSettings.isCustom ? 'Custom per-node settings' : 'Global defaults';
+        const text = [
+            `⚙️ <b>INTEL JOIN SETTINGS</b>`,
+            `📱 Node: +${phone}`,
+            `🧩 Mode: <b>${settingsLabel}</b>`,
+            '',
+            `⏱️ Join delay: <b>${Math.round(nodeSettings.joinDelayMin / 1000)}-${Math.round(nodeSettings.joinDelayMax / 1000)}s</b>`,
+            `🎯 Max joins/run: <b>${nodeSettings.maxJoinsPerRun}</b>`,
+            `📈 Rate hits stop: <b>${nodeSettings.rateHitsStop}</b>`,
+            `🛑 Fail streak stop: <b>${nodeSettings.failStreakStop}</b>`,
+            `📅 Daily attempts: <b>${nodeSettings.dailyMaxJoinAttempts}</b>`,
+            `🕒 Daily window: <b>${Math.round(nodeSettings.dailyWindowMs / 3600000)}h</b>`,
+            `🏷️ Node cap: <b>${nodeSettings.nodeMaxGroups}</b>`,
+            '',
+            '<i>Use these controls to tune Intel joins for this specific node without affecting other nodes.</i>',
+        ].join('\n');
+
+        const reply_markup = {
+            inline_keyboard: [
+                [
+                    { text: 'Delay -', callback_data: `intel_setting_${sessionKey}:delay_min:down`, style: 'primary' },
+                    { text: 'Delay +', callback_data: `intel_setting_${sessionKey}:delay_min:up`, style: 'primary' },
+                ],
+                [
+                    { text: 'Max joins -', callback_data: `intel_setting_${sessionKey}:max_joins:down`, style: 'primary' },
+                    { text: 'Max joins +', callback_data: `intel_setting_${sessionKey}:max_joins:up`, style: 'primary' },
+                ],
+                [
+                    { text: 'Rate stop -', callback_data: `intel_setting_${sessionKey}:rate_stop:down`, style: 'primary' },
+                    { text: 'Rate stop +', callback_data: `intel_setting_${sessionKey}:rate_stop:up`, style: 'primary' },
+                ],
+                [
+                    { text: 'Fail stop -', callback_data: `intel_setting_${sessionKey}:fail_stop:down`, style: 'primary' },
+                    { text: 'Fail stop +', callback_data: `intel_setting_${sessionKey}:fail_stop:up`, style: 'primary' },
+                ],
+                [
+                    { text: 'Daily max -', callback_data: `intel_setting_${sessionKey}:daily_max:down`, style: 'primary' },
+                    { text: 'Daily max +', callback_data: `intel_setting_${sessionKey}:daily_max:up`, style: 'primary' },
+                ],
+                [ { text: '🔁 Reset to global', callback_data: `intel_settings_reset_${sessionKey}`, style: 'danger' } ],
+                [ { text: '🔙 Back to Intel', callback_data: `intel_menu_${sessionKey}`, style: 'primary' } ],
+            ],
+        };
+
+        return { text, reply_markup };
+    }
+
+    bot.action(/^intel_settings_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const view = await buildIntelSettingsView(sessionKey);
+        return ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+    });
+
+    bot.action(/^intel_setting_(.+):(delay_min|max_joins|rate_stop|fail_stop|daily_max):(up|down)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const key = ctx.match[2];
+        const direction = ctx.match[3];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        const settings = await readIntelNodeSettings();
+        const existing = settings[sessionKey] || {};
+        const updated = { ...existing };
+
+        if (key === 'delay_min') {
+            const current = Math.max(15000, Number(existing.joinDelayMin || TG_INTEL_JOIN_DELAY_MIN_MS));
+            const delta = direction === 'up' ? 5000 : -5000;
+            updated.joinDelayMin = Math.max(15000, current + delta);
+            updated.joinDelayMax = Math.max(updated.joinDelayMin, Number(existing.joinDelayMax || TG_INTEL_JOIN_DELAY_MAX_MS));
+        } else if (key === 'max_joins') {
+            const current = Math.max(1, Number(existing.maxJoinsPerRun || TG_INTEL_MAX_JOINS_PER_RUN));
+            updated.maxJoinsPerRun = Math.max(1, current + (direction === 'up' ? 1 : -1));
+        } else if (key === 'rate_stop') {
+            const current = Math.max(1, Number(existing.rateHitsStop || TG_INTEL_RATE_HITS_STOP));
+            updated.rateHitsStop = Math.max(1, current + (direction === 'up' ? 1 : -1));
+        } else if (key === 'fail_stop') {
+            const current = Math.max(2, Number(existing.failStreakStop || TG_INTEL_FAIL_STREAK_STOP));
+            updated.failStreakStop = Math.max(2, current + (direction === 'up' ? 1 : -1));
+        } else if (key === 'daily_max') {
+            const current = Math.max(1, Number(existing.dailyMaxJoinAttempts || TG_INTEL_DAILY_MAX_JOIN_ATTEMPTS));
+            updated.dailyMaxJoinAttempts = Math.max(1, current + (direction === 'up' ? 5 : -5));
+        }
+
+        settings[sessionKey] = updated;
+        await writeIntelNodeSettings(settings);
+        const view = await buildIntelSettingsView(sessionKey);
+        return ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+    });
+
+    bot.action(/^intel_settings_reset_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const settings = await readIntelNodeSettings();
+        if (settings[sessionKey]) {
+            delete settings[sessionKey];
+            await writeIntelNodeSettings(settings);
+        }
+        const view = await buildIntelSettingsView(sessionKey);
+        return ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+    });
 
     // ==========================================
     // ⚙️ ULTIMATE PER-SESSION CONTROL PANEL
@@ -3911,45 +4698,19 @@ async function startTelegram() {
             return { started: false, reason: 'offline', sessionKey, phone };
         }
 
-        const mergedCodes = new Set();
-        let sharedCount = 0;
-        let legacyCount = 0;
-        let pendingCount = 0;
-
-        try {
-            const docs = await Intel.find({
-                $or: [{ code: { $exists: true, $ne: '' } }, { linkCode: { $exists: true, $ne: '' } }],
-            }).select('code linkCode').lean();
-            for (const doc of docs) {
-                const code = String(doc?.code || doc?.linkCode || '').trim();
-                if (code) mergedCodes.add(code);
-            }
-            sharedCount = docs.length;
-        } catch (err) {
-            logger.warn('[Intel Join] Failed loading shared Intel DB', { error: err.message });
-        }
-
-        const intelPath = path.join(__dirname, '../data/intel.json');
-        try {
-            const intel = JSON.parse(await fsp.readFile(intelPath, 'utf8'));
-            const knownLinks = Array.isArray(intel?.knownLinks) ? intel.knownLinks : [];
-            const pendingQueue = Array.isArray(intel?.pendingQueue) ? intel.pendingQueue : [];
-            for (const c of knownLinks) {
-                const code = String(c || '').trim();
-                if (code) mergedCodes.add(code);
-            }
-            for (const item of pendingQueue) {
-                const code = String(item?.code || item || '').trim();
-                if (code) mergedCodes.add(code);
-            }
-            legacyCount = knownLinks.length;
-            pendingCount = pendingQueue.length;
-        } catch {}
-
-        const allCodes = Array.from(mergedCodes);
+        // STRICT: join engine only reads from ACTIVE_JOINABLE pool, never from raw intake
+        const summary = getValidatorSummary();
+        const activeValidatorCodes = getJoinableCodes();
+        const validatorCount = activeValidatorCodes.length;
+        const allCodes = activeValidatorCodes;
         if (allCodes.length === 0) {
+            const cycles = await readIntelNodeCycles();
+            if (cycles[sessionKey]) {
+                delete cycles[sessionKey];
+                await writeIntelNodeCycles(cycles);
+            }
             if (showNodeMessage) {
-                await ctx.editMessageText('⚠️ <b>No GC links in Intel DB.</b>', {
+                await ctx.editMessageText('⚠️ <b>No active GC links in validator.</b>', {
                     parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: backCallback }]] }
                 }).catch(() => {});
             }
@@ -3974,15 +4735,38 @@ async function startTelegram() {
             return { started: false, reason: 'target-reached', sessionKey, phone };
         }
 
+        const nodeSettings = await getIntelNodeSettings(sessionKey);
         const cycles = await readIntelNodeCycles();
-        const prev = cycles[sessionKey] || {};
+        let prev = cycles[sessionKey] || {};
+        
+        // SAFETY: Reset cycle if validator codes don't match previous cycle size
+        // This ensures we don't use stale cursors when validator is fresh/reset
+        const prevActiveCodes = Array.isArray(prev.activeCodes) ? prev.activeCodes : [];
+        const activePoolChanged = prevActiveCodes.length !== allCodes.length ||
+            prevActiveCodes.some((code, idx) => code !== allCodes[idx]);
+        if (prevActiveCodes.length > 0 && activePoolChanged) {
+            logger.info(`[Intel Join] ${phone}: Resetting cycle due to validator refresh (${prevActiveCodes.length}→${allCodes.length} codes or pool content changed)`);
+            prev = {}; // Clear old cycle state
+        }
+        
         const prevStartedAt = Number(prev.startedAt || 0);
         const prevCursor = Number(prev.cursor || 0);
         const now = Date.now();
         const cycleExpired = !prevStartedAt || ((now - prevStartedAt) >= TG_INTEL_NODE_CYCLE_MS);
         const manualResetAt = Number(prev.lastManualResetAt || 0);
         const previousRotationAt = Number(prev.lastRotationAt || 0);
-        const cycleWindowCap = Math.min(TG_INTEL_NODE_MAX_GROUPS, groupsRemainingCapacity, allCodes.length);
+        let dailyWindowStartAt = Number(prev.dailyWindowStartAt || 0);
+        let dailyAttemptedCount = Number(prev.dailyAttempted || 0);
+        let dailyJoinedCount = Number(prev.dailyJoined || 0);
+
+        if (!dailyWindowStartAt || ((now - dailyWindowStartAt) >= nodeSettings.dailyWindowMs)) {
+            dailyWindowStartAt = now;
+            dailyAttemptedCount = 0;
+            dailyJoinedCount = 0;
+        }
+
+        const cycleWindowCap = Math.min(nodeSettings.nodeMaxGroups, groupsRemainingCapacity, allCodes.length);
+        const allowedDailyRemaining = Math.max(0, nodeSettings.dailyMaxJoinAttempts - dailyAttemptedCount);
 
         let codes = [];
         let rotateNow = false;
@@ -3996,6 +4780,9 @@ async function startTelegram() {
             ? (prevStartedAt ? (prevCursor % allCodes.length) : initialCursor)
             : 0;
         codes = buildIntelNodeJoinWindow(allCodes, sessionKey, startCursor, cycleWindowCap, 5);
+        if (codes.length > allowedDailyRemaining) {
+            codes = codes.slice(0, allowedDailyRemaining);
+        }
         const nextCursor = allCodes.length ? ((startCursor + codes.length) % allCodes.length) : 0;
         windowStartCursor = startCursor;
         windowNextCursor = nextCursor;
@@ -4006,13 +4793,29 @@ async function startTelegram() {
             cursor: nextCursor,
             windowStartCursor: startCursor,
             activeCodes: codes,
-            maxGroups: TG_INTEL_NODE_MAX_GROUPS,
+            maxGroups: nodeSettings.nodeMaxGroups,
             targetGroups: TG_INTEL_NODE_TARGET_GROUPS,
             cycleDays: TG_INTEL_NODE_CYCLE_DAYS,
             lastRotationAt: cycleExpired ? now : Number(prev.lastRotationAt || now),
             orderMode: 'seeded-shuffle-chunk',
             chunkSize: 5,
+            dailyWindowStartAt,
+            dailyAttempted: dailyAttemptedCount,
+            dailyJoined: dailyJoinedCount,
         };
+
+        if (codes.length === 0 && allowedDailyRemaining <= 0) {
+            if (showNodeMessage) {
+                await ctx.editMessageText(
+                    `🛑 <b>Daily Intel limit reached</b>
+📱 Node: +${phone}
+📅 Limit: <b>${nodeSettings.dailyMaxJoinAttempts}</b> attempts per ${Math.round(nodeSettings.dailyWindowMs / 3600000)}h
+⏳ Reset in: <b>${formatTimeRemaining((dailyWindowStartAt + nodeSettings.dailyWindowMs) - now)}</b>`,
+                    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: backCallback }]] } }
+                ).catch(() => {});
+            }
+            return { started: false, reason: 'daily-limit', sessionKey, phone };
+        }
         await writeIntelNodeCycles(cycles);
 
         if (codes.length === 0) {
@@ -4024,107 +4827,50 @@ async function startTelegram() {
             return { started: false, reason: 'no-usable', sessionKey, phone };
         }
 
-        let droppedBeforeJoin = 0;
-        let validatedBeforeJoin = 0;
-        let skippedValidationBeforeJoin = 0;
-        if (TG_INTEL_PREVALIDATE_LINKS) {
-            if (showNodeMessage) {
-                await ctx.editMessageText(
-                    `🔎 <b>INTEL VALIDATOR</b>\n📱 Node: +${phone}\n\nChecking invite health for up to <b>${TG_INTEL_VALIDATE_MAX_PER_RUN}</b> link(s) before join...`,
-                    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: backCallback }]] } }
-                ).catch(() => {});
-            }
-            const liveSock = activeSockets.get(sessionKey) || sock;
-            const validated = await prevalidateIntelCodes(liveSock, codes);
-            codes = validated.validCodes;
-            droppedBeforeJoin = validated.dropped;
-            validatedBeforeJoin = validated.validated;
-            skippedValidationBeforeJoin = validated.skippedValidation;
-
-            if (cycles?.[sessionKey]) {
-                // Top up from the remaining pool so we still try to fill the intended cycle window.
-                if (codes.length < cycleWindowCap && allCodes.length > codes.length) {
-                    const seen = new Set(codes);
-                    let cursor = windowNextCursor;
-                    let attempts = 0;
-                    while (codes.length < cycleWindowCap && attempts < allCodes.length) {
-                        const candidate = allCodes[cursor % allCodes.length];
-                        cursor = (cursor + 1) % allCodes.length;
-                        attempts++;
-                        if (!candidate || seen.has(candidate)) continue;
-                        seen.add(candidate);
-                        codes.push(candidate);
-                    }
-                    windowNextCursor = cursor;
-                }
-                cycles[sessionKey].activeCodes = codes;
-                cycles[sessionKey].cursor = windowNextCursor;
-                await writeIntelNodeCycles(cycles);
-            }
-        }
-
-        if (codes.length === 0) {
-            if (showNodeMessage) {
-                await ctx.editMessageText(`⚠️ <b>No usable GC links after validation.</b>\n🧹 Removed dead links: <b>${droppedBeforeJoin}</b>`, {
-                    parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: backCallback }]] }
-                }).catch(() => {});
-            }
-            return { started: false, reason: 'no-usable-after-validation', sessionKey, phone };
-        }
 
         let leftOnRotate = 0;
         let leaveFailedOnRotate = 0;
-        if (rotateNow && alreadyIn.size > 0) {
-            // Cycle expiry cleanup only — soft and capped to reduce ban risk.
-            const groupsToLeave = Array.from(alreadyIn).slice(0, TG_INTEL_SOFT_LEAVE_MAX_PER_RUN);
-            for (const jid of groupsToLeave) {
-                try {
-                    const liveSock = activeSockets.get(sessionKey);
-                    if (!liveSock?.user) throw new Error('socket offline');
-                    await liveSock.groupLeave(jid);
-                    leftOnRotate++;
-                } catch {
-                    leaveFailedOnRotate++;
-                }
-                const leaveDelay = TG_INTEL_LEAVE_DELAY_MIN_MS + Math.floor(Math.random() * (TG_INTEL_LEAVE_DELAY_MAX_MS - TG_INTEL_LEAVE_DELAY_MIN_MS + 1));
-                await new Promise((res) => setTimeout(res, leaveDelay));
-            }
-            alreadyIn = new Set();
-            try {
-                const liveSock = activeSockets.get(sessionKey);
-                const groups = await require('./groupCache').getAllGroups(liveSock || sock);
-                for (const g of Object.values(groups)) alreadyIn.add(g.id);
-            } catch {}
-        }
+        // REMOVED: group leave on rotation — we never leave groups automatically.
+        // Leaving groups triggers anti-spam and loses valuable GC membership.
+        // Cycle rotation just means we pick a new window of links to join.
 
         const statusMsg = showNodeMessage
-            ? await ctx.editMessageText(
-                `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${cycleWindowCap}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n🎯 Target groups: <b>${TG_INTEL_NODE_TARGET_GROUPS}</b>\n\n♻️ Rotation: ${rotateNow ? `YES (new ${TG_INTEL_NODE_CYCLE_DAYS}-day cycle)` : 'NO (continuing cycle)'}${rotatedFromManualReset ? ' • manual reset applied ✅' : ''}\n🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${windowNextCursor}</b>\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}\n🗃 Sources: shared=${sharedCount} • legacy=${legacyCount} • pending=${pendingCount}\n\n⏳ Scanning & joining slowly...`,
+            ? await ctx.reply(
+                `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${cycleWindowCap}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n🎯 Target groups: <b>${TG_INTEL_NODE_TARGET_GROUPS}</b>\n📅 Daily attempts: <b>${dailyAttemptedCount}/${nodeSettings.dailyMaxJoinAttempts}</b>\n⏱️ Join delay: <b>${Math.round(nodeSettings.joinDelayMin / 1000)}-${Math.round(nodeSettings.joinDelayMax / 1000)}s</b>\n\n♻️ Rotation: ${rotateNow ? `YES (new ${TG_INTEL_NODE_CYCLE_DAYS}-day cycle)` : 'NO (continuing cycle)'}${rotatedFromManualReset ? ' • manual reset applied ✅' : ''}\n🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${windowNextCursor}</b>\n📥 Main: <b>${summary.intake}</b> | ✅ Live: <b>${summary.active}</b> | ⚫ Dead: <b>${summary.dead}</b>\n\n⏳ Joining from Live DB...`,
                 { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: backLabel, callback_data: backCallback }]] } }
             ).catch(() => null)
             : null;
 
-        if (droppedBeforeJoin > 0 || validatedBeforeJoin > 0 || skippedValidationBeforeJoin > 0) {
-            const validationLine = `🔎 Validator checked: ${validatedBeforeJoin}${skippedValidationBeforeJoin > 0 ? ` • skipped for speed: ${skippedValidationBeforeJoin}` : ''}`;
-            const dropLine = `🧹 Validator removed dead links: ${droppedBeforeJoin}`;
-            if (statusMsg) {
+        const log = [];
+        let joined = 0, requested = 0, skipped = 0, failed = 0;
+        const pushLog = (line) => { log.unshift(line); if (log.length > 12) log.pop(); };
+        const updateMsg = async (done, total, header) => {
+            if (!statusMsg?.message_id) return;
+            try {
+                const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+                const filled = Math.round(pct / 10);
+                const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
+                const s = getValidatorSummary();
                 await global.tgBot.telegram.editMessageText(
                     ctx.chat.id, statusMsg.message_id, null,
-                    `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${cycleWindowCap}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n🎯 Target groups: <b>${TG_INTEL_NODE_TARGET_GROUPS}</b>\n\n♻️ Rotation: ${rotateNow ? `YES (new ${TG_INTEL_NODE_CYCLE_DAYS}-day cycle)` : 'NO (continuing cycle)'}${rotatedFromManualReset ? ' • manual reset applied ✅' : ''}\n🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${windowNextCursor}</b>\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}\n🗃 Sources: shared=${sharedCount} • legacy=${legacyCount} • pending=${pendingCount}\n${validationLine}\n${dropLine}\n\n⏳ Scanning & joining slowly...`,
-                    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: backLabel, callback_data: backCallback }]] } }
+                    [
+                        `🔗 <b>JOIN INTEL — ${escapeHtml(header)}</b>`,
+                        `📱 Node: +${phone}`,
+                        ``,
+                        `${bar} <b>${pct}%</b>  (${done}/${total})`,
+                        `✅ Joined: <b>${joined}</b>  📨 Requested: <b>${requested}</b>`,
+                        `⏭️ Skipped: <b>${skipped}</b>  ❌ Failed: <b>${failed}</b>`,
+                        `📥 Main: <b>${s.intake}</b>  ✅ Live: <b>${s.active}</b>  ⚫ Dead: <b>${s.dead}</b>`,
+                        ``,
+                        `<b>Recent activity:</b>`,
+                        `<code>${log.slice(0, 8).join('\n') || 'Starting...'}</code>`,
+                    ].join('\n'),
+                    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+                        [{ text: '⏸ Stop', callback_data: `intel_stop_${sessionKey}` }],
+                        [{ text: backLabel, callback_data: backCallback }],
+                    ]}}
                 ).catch(() => {});
-            }
-        }
-
-        const log = [];
-        const pushLog = (line) => { log.unshift(line); if (log.length > 8) log.pop(); };
-        const updateMsg = async (done, total, header) => {
-            if (!statusMsg) return;
-            await global.tgBot.telegram.editMessageText(
-                ctx.chat.id, statusMsg.message_id, null,
-                `🔗 <b>INTEL GC JOIN — ${header}</b>\n📱 Node: +${phone}\n📊 Progress: <b>${done}/${total}</b>\n\n<code>${log.join('\n')}</code>`,
-                { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: backLabel, callback_data: backCallback }]] } }
-            ).catch(() => {});
+            } catch {}
         };
 
         const resumePath = path.join(__dirname, `../data/intel_join_${sessionKey}.json`);
@@ -4139,6 +4885,7 @@ async function startTelegram() {
         (async () => {
             global._intelJoinWorkers.set(sessionKey, {
                 running: true,
+                stopRequested: false,
                 startedAt: Date.now(),
                 chatId: ctx.chat.id,
                 statusMessageId: statusMsg?.message_id || null,
@@ -4152,13 +4899,29 @@ async function startTelegram() {
                 state: 'running',
             });
 
-            let joined = 0, requested = 0, skipped = 0, failed = 0;
+            // Reset counters (declared in outer scope so updateMsg closure can read them)
+            joined = 0; requested = 0; skipped = 0; failed = 0;
             let reconnectWaits = 0;
             let failStreak = 0;
             let rateHits = 0;
             let safetyStoppedReason = '';
+            let dailyAttemptedCount = Number(cycles[sessionKey].dailyAttempted || 0);
+            let dailyJoinedCount = Number(cycles[sessionKey].dailyJoined || 0);
 
             for (let i = startIndex; i < codes.length; i++) {
+                const workerState = global._intelJoinWorkers.get(sessionKey) || {};
+                if (workerState.stopRequested) {
+                    safetyStoppedReason = 'stopped by operator';
+                    pushLog('⏹️ Stop requested by operator');
+                    await updateMsg(i, codes.length, 'STOPPED');
+                    break;
+                }
+                if (dailyAttemptedCount >= nodeSettings.dailyMaxJoinAttempts) {
+                    safetyStoppedReason = `daily limit reached (${nodeSettings.dailyMaxJoinAttempts})`;
+                    pushLog(`🛑 Safety stop: ${safetyStoppedReason}`);
+                    await updateMsg(i, codes.length, 'DAILY LIMIT');
+                    break;
+                }
                 if (i % 5 === 0) await fsp.writeFile(resumePath, JSON.stringify({ lastIndex: i, sessionKey }), 'utf8').catch(() => {});
 
                 const runSock = activeSockets.get(sessionKey);
@@ -4185,64 +4948,88 @@ async function startTelegram() {
 
                 try {
                     const result = await runSock.groupAcceptInvite(code);
-                    if (result && typeof result === 'string') {
-                        joined++;
-                        failStreak = 0;
-                        pushLog(`✅ Joined: ${result.split('@')[0]}`);
-                    } else {
-                        requested++;
-                        failStreak = 0;
-                        pushLog(`📨 Requested: ${shortCode}`);
-                    }
+                    // groupAcceptInvite always returns the group JID string on success
+                    joined++;
+                    dailyJoinedCount++;
+                    failStreak = 0;
+                    pushLog(`✅ Joined: ${String(result || code).split('@')[0]}`);
+                    await markLinkActive(code, { source: 'intel_join', sessionKey, nodePhone: phone, lastAttemptAt: new Date() }).catch(() => {});
                 } catch (err) {
                     const m = err.message?.toLowerCase() || '';
-                    if (m.includes('already') || m.includes('already-participant')) {
+                    const isApprovalFlow = /approval|request|admin|not-acceptable|not acceptable|pending approval/.test(m);
+
+                    if (isApprovalFlow) {
+                        // Always count as requested — V4 is best-effort
+                        let v4Sent = false;
+                        if (typeof runSock.groupGetInviteInfo === 'function' && typeof runSock.groupAcceptInviteV4 === 'function') {
+                            try {
+                                const info = await runSock.groupGetInviteInfo(code).catch(() => null);
+                                if (info?.id) {
+                                    await runSock.groupAcceptInviteV4(runSock.user.id, {
+                                        groupJid: info.id,
+                                        inviteCode: code,
+                                        inviteExpiration: info.inviteExpiration || 0,
+                                    });
+                                    v4Sent = true;
+                                }
+                            } catch {}
+                        }
+                        requested++;
+                        failStreak = 0;
+                        pushLog(`📨 ${v4Sent ? 'Requested (V4)' : 'Requested'}: ${shortCode}`);
+                        await markLinkActive(code, { source: 'intel_join_request', sessionKey, nodePhone: phone, lastAttemptAt: new Date() }).catch(() => {});
+                    } else if (m.includes('already') || m.includes('already-participant')) {
                         skipped++;
+                        failStreak = 0;
+                        await markLinkActive(code, { source: 'intel_join', sessionKey, nodePhone: phone, note: 'already-in-group', lastAttemptAt: new Date() }).catch(() => {});
                         pushLog(`⏭️ Already in: ${shortCode}`);
                     } else if (isIntelDeadLinkError(m)) {
                         skipped++;
-                        pushLog(`🗑️ Dead/invalid: ${shortCode}`);
                         try {
-                            const purgeStats = await purgeIntelCodeEverywhere(code, 'runtime-dead');
-                            if ((purgeStats.dbDeleted + purgeStats.fileRemoved + purgeStats.cycleRemoved) > 0) {
-                                pushLog(`🧹 Purged globally: ${shortCode}`);
-                            }
-                        } catch (purgeErr) {
-                            logger.warn('[Intel Join] Failed to purge dead link globally', { code, error: purgeErr.message });
+                            returnLinkToMain(code, 'join_intel_dead');
+                            pushLog(`♻️ Dead → Main (revalidate): ${shortCode}`);
+                        } catch (retErr) {
+                            logger.warn('[Intel Join] returnLinkToMain failed', { code, error: retErr.message });
                         }
                     } else if (isIntelRestrictedError(m)) {
                         skipped++;
-                        failStreak++;
                         pushLog(`🚫 Restricted: ${shortCode}`);
                     } else if (isIntelRateLimitError(m)) {
                         rateHits++;
                         failStreak++;
-                        pushLog(`⏳ Rate limit hit — pausing ${Math.round(TG_INTEL_RATE_PAUSE_MS / 60000)}m...`);
+                        pushLog(`⏳ Rate limit — pausing ${Math.round(TG_INTEL_RATE_PAUSE_MS / 60000)}m...`);
                         await updateMsg(i + 1, codes.length, 'RATE LIMITED — PAUSING');
                         await new Promise(res => setTimeout(res, TG_INTEL_RATE_PAUSE_MS));
                         failed++;
                     } else {
                         failed++;
                         failStreak++;
-                        pushLog(`❌ Failed: ${shortCode} — ${String(err.message || '').slice(0, 25)}`);
+                        pushLog(`❌ Failed: ${shortCode} — ${String(err.message || '').slice(0, 30)}`);
                         logger.warn(`[Intel Join] ${code}: ${err.message}`);
                     }
                 }
 
-                if (joined >= TG_INTEL_MAX_JOINS_PER_RUN) {
-                    safetyStoppedReason = `run cap reached (${TG_INTEL_MAX_JOINS_PER_RUN})`;
+                dailyAttemptedCount++;
+                cycles[sessionKey].dailyAttempted = dailyAttemptedCount;
+                cycles[sessionKey].dailyJoined = dailyJoinedCount;
+                if ((i + 1) % 5 === 0) {
+                    await writeIntelNodeCycles(cycles);
+                }
+
+                if (joined >= nodeSettings.maxJoinsPerRun) {
+                    safetyStoppedReason = `run cap reached (${nodeSettings.maxJoinsPerRun})`;
                     pushLog(`🛑 Safety stop: ${safetyStoppedReason}`);
                     await updateMsg(i + 1, codes.length, 'SAFETY STOP');
                     break;
                 }
-                if (rateHits >= TG_INTEL_RATE_HITS_STOP) {
-                    safetyStoppedReason = `rate hits ${rateHits}/${TG_INTEL_RATE_HITS_STOP}`;
+                if (rateHits >= nodeSettings.rateHitsStop) {
+                    safetyStoppedReason = `rate hits ${rateHits}/${nodeSettings.rateHitsStop}`;
                     pushLog(`🛑 Safety stop: ${safetyStoppedReason}`);
                     await updateMsg(i + 1, codes.length, 'SAFETY STOP');
                     break;
                 }
-                if (failStreak >= TG_INTEL_FAIL_STREAK_STOP) {
-                    safetyStoppedReason = `fail streak ${failStreak}/${TG_INTEL_FAIL_STREAK_STOP}`;
+                if (failStreak >= nodeSettings.failStreakStop) {
+                    safetyStoppedReason = `fail streak ${failStreak}/${nodeSettings.failStreakStop}`;
                     pushLog(`🛑 Safety stop: ${safetyStoppedReason}`);
                     await updateMsg(i + 1, codes.length, 'SAFETY STOP');
                     break;
@@ -4253,6 +5040,7 @@ async function startTelegram() {
                     ...st,
                     running: true,
                     state: 'running',
+                    stopRequested: st.stopRequested || false,
                     done: i + 1,
                     total: codes.length,
                     joined,
@@ -4261,9 +5049,10 @@ async function startTelegram() {
                     failed,
                 });
 
-                if ((i + 1) % 5 === 0) await updateMsg(i + 1, codes.length, 'IN PROGRESS');
+                // Update live log after every join — delays are 45-90s so every result matters
+                await updateMsg(i + 1, codes.length, 'IN PROGRESS');
                 if (i < codes.length - 1) {
-                    const joinDelay = TG_INTEL_JOIN_DELAY_MIN_MS + Math.floor(Math.random() * (TG_INTEL_JOIN_DELAY_MAX_MS - TG_INTEL_JOIN_DELAY_MIN_MS + 1));
+                    const joinDelay = nodeSettings.joinDelayMin + Math.floor(Math.random() * (nodeSettings.joinDelayMax - nodeSettings.joinDelayMin + 1));
                     await new Promise(res => setTimeout(res, joinDelay));
                 }
             }
@@ -4271,11 +5060,15 @@ async function startTelegram() {
             await fsp.unlink(resumePath).catch(() => {});
             try {
                 const latest = await readIntelNodeCycles();
-                if (latest[sessionKey]) {
-                    latest[sessionKey].lastRunAt = Date.now();
-                    latest[sessionKey].lastRunStats = { joined, requested, skipped, failed };
-                    await writeIntelNodeCycles(latest);
-                }
+                latest[sessionKey] = {
+                    ...(latest[sessionKey] || {}),
+                    ...cycles[sessionKey],
+                    lastRunAt: Date.now(),
+                    lastRunStats: { joined, requested, skipped, failed },
+                    dailyAttempted: dailyAttemptedCount,
+                    dailyJoined: dailyJoinedCount,
+                };
+                await writeIntelNodeCycles(latest);
             } catch {}
 
             const result = { sessionKey, phone, total: codes.length, joined, requested, skipped, failed, doneAt: Date.now() };
@@ -4285,14 +5078,24 @@ async function startTelegram() {
             if (statusMsg) {
                 await global.tgBot.telegram.editMessageText(
                     ctx.chat.id, statusMsg.message_id, null,
-                    `✅ <b>INTEL GC JOIN COMPLETE</b>\n📱 Node: +${phone}\n\n♻️ Cycle window: <b>${codes.length}/${TG_INTEL_NODE_MAX_GROUPS}</b>${rotateNow ? `\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}` : ''}${safetyStoppedReason ? `\n🛑 Safety stop: <b>${escapeHtml(safetyStoppedReason)}</b>` : ''}\n\n✅ Joined: <b>${joined}</b>\n📨 Requested (approval needed): <b>${requested}</b>\n⏭️ Skipped (dead/already in): <b>${skipped}</b>\n❌ Failed: <b>${failed}</b>`,
+                    `✅ <b>INTEL GC JOIN COMPLETE</b>\n📱 Node: +${phone}\n\n♻️ Cycle window: <b>${codes.length}/${TG_INTEL_NODE_MAX_GROUPS}</b>${safetyStoppedReason ? `\n🛑 Safety stop: <b>${escapeHtml(safetyStoppedReason)}</b>` : ''}\n\n✅ Joined: <b>${joined}</b>\n📨 Requested (approval needed): <b>${requested}</b>\n⏭️ Skipped (dead/already in): <b>${skipped}</b>\n❌ Failed: <b>${failed}</b>`,
                     { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: backLabel, callback_data: backCallback }]] } }
                 ).catch(() => {});
             }
             global._intelJoinWorkers.delete(sessionKey);
-        })().catch((err) => {
-            logger.error('[Intel Join] Worker crashed', { sessionKey, error: err.message });
+        })().catch(async (err) => {
+            logger.error('[Intel Join] Worker crashed', { sessionKey, error: err.message, stack: err.stack });
             global._intelJoinWorkers.delete(sessionKey);
+            // Notify user of crash with the actual error
+            const errText = `❌ <b>Intel Join crashed</b>\n📱 Node: +${phone}\n\n<code>${escapeHtml(String(err.message || err))}</code>\n\n<i>Check logs for full stack trace.</i>`;
+            if (statusMsg?.message_id) {
+                await global.tgBot?.telegram?.editMessageText(
+                    ctx.chat.id, statusMsg.message_id, null, errText,
+                    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: backLabel, callback_data: backCallback }]] } }
+                ).catch(() => {});
+            } else {
+                await global.tgBot?.telegram?.sendMessage(ctx.chat.id, errText, { parse_mode: 'HTML' }).catch(() => {});
+            }
         });
 
         return { started: true, reason: 'started', sessionKey, phone };
@@ -4404,6 +5207,101 @@ async function startTelegram() {
         }
     });
 
+    // ── Intel Join Live Log viewer ─────────────────────────────────────────────────────────────────────────────────────
+    bot.action(/^intel_livelog_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const worker = global._intelJoinWorkers?.get(sessionKey);
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        if (!worker?.running) {
+            return ctx.reply(`ℹ️ Intel Join is not running for +${phone}.`, { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const s = getValidatorSummary();
+        const pct = worker.total > 0 ? Math.round((worker.done / worker.total) * 100) : 0;
+        const filled = Math.round(pct / 10);
+        const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
+        return ctx.reply(
+            [
+                `🔗 <b>JOIN INTEL — LIVE LOG</b>`,
+                `📱 Node: +${escapeHtml(phone)}`,
+                ``,
+                `${bar} <b>${pct}%</b>  (${worker.done}/${worker.total})`,
+                `✅ Joined: <b>${worker.joined}</b>  📨 Requested: <b>${worker.requested}</b>`,
+                `⏭️ Skipped: <b>${worker.skipped}</b>  ❌ Failed: <b>${worker.failed}</b>`,
+                `📥 Main: <b>${s.intake}</b>  ✅ Live: <b>${s.active}</b>  ⚫ Dead: <b>${s.dead}</b>`,
+                `🏃 State: <b>${worker.state || 'running'}</b>`,
+            ].join('\n'),
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+                [{ text: '⏸ Stop', callback_data: `intel_stop_${sessionKey}` },
+                 { text: '🔄 Refresh', callback_data: `intel_livelog_${sessionKey}` }],
+                [{ text: '🔙 Back to Intel', callback_data: `intel_menu_${sessionKey}` }],
+            ]}}
+        ).catch(() => {});
+    });
+
+    bot.action(/^intel_stop_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const worker = global._intelJoinWorkers?.get(sessionKey);
+        if (!worker || !worker.running) {
+            return ctx.reply('ℹ️ Intel join is not currently running for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        global._intelJoinWorkers.set(sessionKey, { ...worker, stopRequested: true });
+        return ctx.reply('⏹️ Intel join stop requested. The worker will stop safely at the next checkpoint.', { parse_mode: 'HTML' }).catch(() => {});
+    });
+
+    bot.action(/^intel_restart_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        const worker = global._intelJoinWorkers?.get(sessionKey);
+        if (worker?.running) {
+            global._intelJoinWorkers.set(sessionKey, { ...worker, stopRequested: true });
+            return ctx.reply('🔁 Intel join restart requested. The current run will stop safely and you can start again once it finishes.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        try {
+            const cycles = await readIntelNodeCycles();
+            const existing = cycles[sessionKey] || {};
+            cycles[sessionKey] = {
+                ...existing,
+                activeCodes: [],
+                startedAt: Date.now(),
+                lastManualResetAt: Date.now(),
+            };
+            await writeIntelNodeCycles(cycles);
+            const resumePath = path.join(__dirname, `../data/intel_join_${sessionKey}.json`);
+            await fsp.unlink(resumePath).catch(() => {});
+            global._intelJoinResults?.delete(sessionKey);
+        } catch (err) {
+            logger.warn('[Intel Join] Failed to prepare restart', { sessionKey, error: err.message });
+        }
+
+        const res = await launchIntelJoinForSession(ctx, sessionKey, {
+            showNodeMessage: true,
+            backCallback: `node_${sessionKey}`,
+            backLabel: '🔙 Back to Node',
+        });
+        if (!res.started) {
+            return ctx.reply('⚠️ Intel restart could not be started. Please refresh the menu or check node status.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+    });
+
     // ─── INTEL GC JOIN (all nodes, owner) with live aggregate output ─────────
     bot.action('intel_join_all', async (ctx) => {
         await ctx.answerCbQuery().catch(() => {});
@@ -4418,22 +5316,42 @@ async function startTelegram() {
             return ctx.reply('❌ No online nodes found.', { parse_mode: 'HTML' }).catch(() => {});
         }
 
+        const liveCount = getJoinableCodes().length;
+        if (!liveCount) {
+            return ctx.reply('⚠️ Live DB is empty. Run Validator Hub first to validate links.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
         const status = await ctx.reply(
-            `🔗 <b>INTEL JOIN (ALL NODES)</b>\n\nStarting queue for <b>${entries.length}</b> node(s)...`,
+            `🔗 <b>INTEL JOIN (ALL NODES)</b>\n\n📦 Live links: <b>${liveCount}</b>\n📡 Launching <b>${entries.length}</b> node(s)…`,
             { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Hub', callback_data: 'menu_main' }]] } }
         ).catch(() => null);
 
+        // Launch all nodes — give each a small stagger so they don't hammer WA simultaneously
         const startedKeys = [];
-        for (const [sessionKey] of entries) {
+        for (let i = 0; i < entries.length; i++) {
+            const [sessionKey] = entries[i];
+            if (i > 0) await new Promise(r => setTimeout(r, 3000));
             const launch = await launchIntelJoinForSession(ctx, sessionKey, { showNodeMessage: false });
             if (launch.started) startedKeys.push(sessionKey);
         }
 
         if (!startedKeys.length) {
-            return ctx.reply('⚠️ No nodes were started (already running or offline).', { parse_mode: 'HTML' }).catch(() => {});
+            if (status?.message_id) {
+                await global.tgBot.telegram.editMessageText(
+                    ctx.chat.id, status.message_id, null,
+                    `⚠️ <b>No nodes started</b>\n\nAll nodes may already be running, at daily limit, or at group cap.`,
+                    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Hub', callback_data: 'menu_main' }]] } }
+                ).catch(() => {});
+            }
+            return;
         }
 
+        // Wait a moment for workers to register themselves in _intelJoinWorkers
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Live update loop — polls every 15s
         (async () => {
+            let staleCount = 0;
             for (;;) {
                 const workerMap = global._intelJoinWorkers || new Map();
                 const resultMap = global._intelJoinResults || new Map();
@@ -4445,26 +5363,40 @@ async function startTelegram() {
                     const w = workerMap.get(sessionKey);
                     if (w?.running) {
                         running++;
-                        lines.push(`🟡 +${phone} • ${w.done || 0}/${w.total || 0} • ✅${w.joined || 0} 📨${w.requested || 0} ⏭️${w.skipped || 0} ❌${w.failed || 0}`);
+                        const pct = w.total > 0 ? Math.round((w.done / w.total) * 100) : 0;
+                        lines.push(`🟡 +${phone}  ${pct}%  ✅${w.joined || 0} 📨${w.requested || 0} ⏭️${w.skipped || 0} ❌${w.failed || 0}  (${w.done || 0}/${w.total || 0})`);
                     } else {
                         const r = resultMap.get(sessionKey);
-                        if (r) lines.push(`✅ +${phone} • done • ✅${r.joined} 📨${r.requested} ⏭️${r.skipped} ❌${r.failed}`);
-                        else lines.push(`⚪ +${phone} • queued`);
+                        if (r) {
+                            lines.push(`✅ +${phone}  done  ✅${r.joined} 📨${r.requested} ⏭️${r.skipped} ❌${r.failed}`);
+                        } else {
+                            lines.push(`⚪ +${phone}  idle`);
+                        }
                     }
                 }
 
+                const s = getValidatorSummary();
                 if (status?.message_id) {
                     await global.tgBot.telegram.editMessageText(
-                        ctx.chat.id,
-                        status.message_id,
-                        null,
-                        `🔗 <b>INTEL JOIN (ALL NODES)</b>\n📡 Nodes started: <b>${startedKeys.length}</b>\n⏳ Running: <b>${running}</b>\n\n<code>${lines.join('\n')}</code>`,
+                        ctx.chat.id, status.message_id, null,
+                        [
+                            `🔗 <b>INTEL JOIN (ALL NODES)</b>`,
+                            `📡 Nodes: <b>${startedKeys.length}</b>  ⏳ Running: <b>${running}</b>`,
+                            `📥 Main: <b>${s.intake}</b>  ✅ Live: <b>${s.active}</b>  ⚫ Dead: <b>${s.dead}</b>`,
+                            ``,
+                            `<code>${lines.join('\n')}</code>`,
+                        ].join('\n'),
                         { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Hub', callback_data: 'menu_main' }]] } }
                     ).catch(() => {});
                 }
 
-                if (running === 0) break;
-                await new Promise((res) => setTimeout(res, 5000));
+                if (running === 0) {
+                    staleCount++;
+                    if (staleCount >= 2) break; // confirm all done across 2 polls
+                } else {
+                    staleCount = 0;
+                }
+                await new Promise(r => setTimeout(r, 15000));
             }
         })().catch(() => {});
     });
@@ -4696,29 +5628,25 @@ async function startTelegram() {
         }
 
         try {
-            // Get ALL links from SHARED Intel DB (not filtered by botId)
-            const docs = await Intel.find({}).sort({ seenAt: -1 }).lean();
-            
-            if (!docs.length) {
+            const activeLinks = getActiveLinks();
+            if (!activeLinks.length) {
                 return ctx.reply(
-                    '🔗 <b>INTEL DATABASE</b>\n\n❌ No links stored yet.\n\n<i>When this node joins groups, links will be saved here for cross-node access.</i>',
+                    '🔗 <b>VALIDATOR ACTIVE LINKS</b>\n\n❌ No active validated links found yet.\n\n<i>When a node validates group links, they will appear here.</i>',
                     { parse_mode: 'HTML' }
                 ).catch(() => {});
             }
 
-            // Format first page
             const PAGE_SIZE = 10;
-            const pageLinks = docs.slice(0, PAGE_SIZE);
+            const pageLinks = activeLinks.slice(0, PAGE_SIZE);
             const lines = pageLinks.map((link, idx) => {
-                const statusEmoji = link.status === 'valid' ? '✅' : link.status === 'expired' ? '❌' : '❓';
-                const memberText = link.members > 0 ? ` • ${link.members} members` : '';
-                return `${idx + 1}. ${statusEmoji} <b>${escapeHtml(link.groupName || link.groupJid)}</b>${memberText}\n   <code>${link.code || link.linkCode || 'N/A'}</code>`;
+                const code = String(link.code || '').trim() || 'N/A';
+                return `${idx + 1}. <code>${escapeHtml(code)}</code>`;
             });
 
-            const totalPages = Math.ceil(docs.length / PAGE_SIZE);
+            const totalPages = Math.ceil(activeLinks.length / PAGE_SIZE);
             const text = [
-                '🔗 <b>INTEL LINKS DATABASE</b>',
-                `<i>Page 1 of ${totalPages} • Total: ${docs.length} link(s)</i>`,
+                '🔗 <b>VALIDATOR ACTIVE LINKS</b>',
+                `<i>Page 1 of ${totalPages} • Total: ${activeLinks.length} active validator link(s)</i>`,
                 '',
                 ...lines,
                 '',
@@ -4728,13 +5656,13 @@ async function startTelegram() {
             ctx.session = ctx.session || {};
             ctx.session.intelState = {
                 sessionKey,
-                allDocs: docs,
+                allDocs: activeLinks,
                 currentPage: 0,
                 PAGE_SIZE,
             };
 
             const inline_keyboard = [];
-            if (docs.length > PAGE_SIZE) {
+            if (activeLinks.length > PAGE_SIZE) {
                 inline_keyboard.push([{ text: '➡️ Next Page', callback_data: 'intel_bcast_next' }]);
             }
             inline_keyboard.push([{ text: '❌ Close', callback_data: 'intel_bcast_close' }]);
@@ -4769,9 +5697,11 @@ async function startTelegram() {
 
         const lines = pageLinks.map((link, idx) => {
             const globalIdx = start + idx + 1;
-            const statusEmoji = link.status === 'valid' ? '✅' : link.status === 'expired' ? '❌' : '❓';
-            const memberText = link.members > 0 ? ` • ${link.members} members` : '';
-            return `${globalIdx}. ${statusEmoji} <b>${escapeHtml(link.groupName || link.groupJid)}</b>${memberText}\n   <code>${link.code || link.linkCode || 'N/A'}</code>`;
+            const code = String(link.code || link.linkCode || link || '').trim() || 'N/A';
+            const statusEmoji = link.status === 'valid' || link.status === 'active' ? '✅' : link.status === 'expired' ? '❌' : '✅';
+            const memberText = Number(link.members) > 0 ? ` • ${link.members} members` : '';
+            const title = link.groupName || link.groupJid ? `<b>${escapeHtml(link.groupName || link.groupJid)}</b>` : `<code>${escapeHtml(code)}</code>`;
+            return `${globalIdx}. ${statusEmoji} ${title}${memberText}\n   <code>${escapeHtml(code)}</code>`;
         });
 
         const totalPages = Math.ceil(state.allDocs.length / state.PAGE_SIZE);
@@ -4814,9 +5744,11 @@ async function startTelegram() {
 
         const lines = pageLinks.map((link, idx) => {
             const globalIdx = start + idx + 1;
-            const statusEmoji = link.status === 'valid' ? '✅' : link.status === 'expired' ? '❌' : '❓';
-            const memberText = link.members > 0 ? ` • ${link.members} members` : '';
-            return `${globalIdx}. ${statusEmoji} <b>${escapeHtml(link.groupName || link.groupJid)}</b>${memberText}\n   <code>${link.code || link.linkCode || 'N/A'}</code>`;
+            const code = String(link.code || link.linkCode || link || '').trim() || 'N/A';
+            const statusEmoji = link.status === 'valid' || link.status === 'active' ? '✅' : link.status === 'expired' ? '❌' : '✅';
+            const memberText = Number(link.members) > 0 ? ` • ${link.members} members` : '';
+            const title = link.groupName || link.groupJid ? `<b>${escapeHtml(link.groupName || link.groupJid)}</b>` : `<code>${escapeHtml(code)}</code>`;
+            return `${globalIdx}. ${statusEmoji} ${title}${memberText}\n   <code>${escapeHtml(code)}</code>`;
         });
 
         const totalPages = Math.ceil(state.allDocs.length / state.PAGE_SIZE);
@@ -5563,6 +6495,108 @@ async function startTelegram() {
             parse_mode: 'HTML',
             reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Node', callback_data: `node_${sessionKey}` }]] }
         }).catch(() => {});
+    });
+
+    // ── GLOBAL GC STATUS MANAGEMENT ─────────────────────────────────────────────────────────────────────────────────────
+    const GLOBAL_GC_STATUS_PATH = path.join(__dirname, '../data/warmup-config.json');
+
+    function loadGlobalGcStatus() {
+        try {
+            if (!fs.existsSync(GLOBAL_GC_STATUS_PATH)) return null;
+            return JSON.parse(fs.readFileSync(GLOBAL_GC_STATUS_PATH, 'utf8'));
+        } catch { return null; }
+    }
+
+    async function saveGlobalGcStatus(text) {
+        // Build link preview if text contains a URL
+        let sourceMessage = { conversation: text };
+        const urlMatch = text.match(/https?:\/\/[^\s]+/);
+        if (urlMatch) {
+            try {
+                const preview = await buildLinkPreview(text, false).catch(() => null);
+                if (preview?.externalAdReply) {
+                    sourceMessage = {
+                        extendedTextMessage: {
+                            text,
+                            matchedText: urlMatch[0],
+                            canonicalUrl: urlMatch[0],
+                            title: preview.externalAdReply.title || '',
+                            description: preview.externalAdReply.body || '',
+                            previewType: 0,
+                            ...(preview.externalAdReply.jpegThumbnail ? { jpegThumbnail: preview.externalAdReply.jpegThumbnail } : {}),
+                            contextInfo: preview,
+                        }
+                    };
+                } else {
+                    sourceMessage = {
+                        extendedTextMessage: {
+                            text,
+                            matchedText: urlMatch[0],
+                            canonicalUrl: urlMatch[0],
+                            previewType: 0,
+                        }
+                    };
+                }
+            } catch {}
+        }
+        const config = { statusPayload: text, mediaType: null, sourceMessage, setAt: Date.now(), setBy: 'telegram_global' };
+        await fsp.writeFile(GLOBAL_GC_STATUS_PATH, JSON.stringify(config, null, 2), 'utf8');
+        return config;
+    }
+
+    function getGlobalGcStatusView() {
+        const cfg = loadGlobalGcStatus();
+        const hasStatus = !!(cfg?.statusPayload);
+        const preview = hasStatus ? cfg.statusPayload.slice(0, 200) + (cfg.statusPayload.length > 200 ? '...' : '') : '<i>Not set</i>';
+        const setAt = cfg?.setAt ? new Date(cfg.setAt).toLocaleString() : 'Never';
+        return {
+            text: [
+                `🌸 <b>GLOBAL GC STATUS</b>`,
+                ``,
+                `Status: <b>${hasStatus ? '🟢 Active' : '🔴 Not set'}</b>`,
+                hasStatus ? `Set: <i>${escapeHtml(setAt)}</i>` : '',
+                ``,
+                `<b>Current content:</b>`,
+                `<code>${escapeHtml(preview)}</code>`,
+                ``,
+                `<i>This fires on ALL nodes when they join a new group.</i>`,
+            ].filter(Boolean).join('\n'),
+            reply_markup: { inline_keyboard: [
+                [{ text: '✏️ Set / Update Status', callback_data: 'global_gcstatus_set' }],
+                [{ text: '🗑️ Remove Status', callback_data: 'global_gcstatus_remove' }],
+                [{ text: '🔙 Back to Hub', callback_data: 'menu_main' }],
+            ]},
+        };
+    }
+
+    bot.action('global_gcstatus_menu', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const { text, reply_markup } = getGlobalGcStatusView();
+        return replyOrEditTelegramView(ctx, text, reply_markup, 'Global GC Status');
+    });
+
+    bot.action('global_gcstatus_set', (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingGlobalGcStatus = true;
+        return ctx.editMessageText(
+            `🌸 <b>SET GLOBAL GC STATUS</b>\n\n` +
+            `Send the text you want posted to every group when a node joins.\n` +
+            `Links will get a full preview automatically.\n\n` +
+            `<i>Send your message now...</i>`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'global_gcstatus_menu' }]] } }
+        ).catch(() => {});
+    });
+
+    bot.action('global_gcstatus_remove', async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        try {
+            await fsp.unlink(GLOBAL_GC_STATUS_PATH).catch(() => {});
+        } catch {}
+        return ctx.editMessageText(
+            `🗑️ <b>Global GC Status removed.</b>\n\nNodes will no longer post a status when joining new groups.`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'global_gcstatus_menu' }]] } }
+        ).catch(() => {});
     });
 
     bot.action(/^gs_reset_(.+)$/, (ctx) => {
@@ -6379,66 +7413,13 @@ Returns the group's public invite link if available.`;
                 return next();
             }
 
+
             queue.push(async () => {
                 try {
-                    const { extractWhatsAppCodes, processForwardedLinks } = require('./telegram/forwardedLinkExtractor');
-                    const extractedCodes = extractWhatsAppCodes(text);
-                    // Safety cap: avoid flooding validation pipeline on huge forwarded dumps
-                    const codes = extractedCodes.slice(0, 40);
-
-                    if (codes.length > 0) {
-                        // User is forwarding a message that might contain WhatsApp links
-                        // Offer to process and store them
-                        const statusMsg = await ctx.reply('🔗 <b>Found WhatsApp links in forwarded message!</b>\n\n⏳ <i>Validating & storing...</i>', { parse_mode: 'HTML' }).catch(() => null);
-
-                        // Get the active node (if available)
-                        const scoped = resolveTelegramNodeScope(userId, userRole);
-                        if (scoped?.sock?.user) {
-                            // Process links with the active WhatsApp node
-                            const result = await processForwardedLinks(ctx, scoped.sock, scoped.sessionKey, {});
-
-                            if (result.saved > 0) {
-                                // Store to SHARED Intel DB (not per-botId)
-                                for (const code of codes) {
-                                    try {
-                                        const existingDoc = await Intel.findOne({ code });
-                                        if (!existingDoc) {
-                                            const intelEntry = new Intel({
-                                                code,
-                                                groupName: `Forwarded link (${code.slice(0, 8)}...)`,
-                                                status: 'valid',
-                                                source: 'telegram_forward',
-                                                seenAt: new Date(),
-                                            });
-                                            await intelEntry.save().catch(() => {});
-                                        }
-                                    } catch (err) {
-                                        logger.warn('[ForwardedLinkCapture] Failed to store code', { error: err.message });
-                                    }
-                                }
-                                const resultMsg = `✅ <b>Saved ${result.saved} link(s) to SHARED Intel DB!</b>`;
-                                if (statusMsg) {
-                                    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, resultMsg, { parse_mode: 'HTML' }).catch(() => {});
-                                } else {
-                                    await ctx.reply(resultMsg, { parse_mode: 'HTML' }).catch(() => {});
-                                }
-                            } else {
-                                const resultMsg = `🔗 <b>Found ${codes.length} WhatsApp link(s) but none were saved.</b>\n\n⚠️ <i>They may be invalid or already in database.</i>`;
-                                if (statusMsg) {
-                                    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, resultMsg, { parse_mode: 'HTML' }).catch(() => {});
-                                } else {
-                                    await ctx.reply(resultMsg, { parse_mode: 'HTML' }).catch(() => {});
-                                }
-                            }
-                        } else {
-                            // No active node, just notify user
-                            const resultMsg = `🔗 <b>Found ${codes.length} WhatsApp link(s) in forwarded message</b>\n\n⚠️ <i>No active node to validate & store them.</i>\n\n💡 <b>Tip:</b> Enable a WhatsApp node first, then forward the message again to auto-store the links.`;
-                            if (statusMsg) {
-                                await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, resultMsg, { parse_mode: 'HTML' }).catch(() => {});
-                            } else {
-                                await ctx.reply(resultMsg, { parse_mode: 'HTML' }).catch(() => {});
-                            }
-                        }
+                    const { processForwardedLinks, formatResultMessage } = require('./telegram/forwardedLinkExtractor');
+                    const result = await processForwardedLinks(text, { source: 'telegram_forward', userId });
+                    if (result.extracted > 0) {
+                        await ctx.reply(formatResultMessage(result), { parse_mode: 'HTML' }).catch(() => {});
                     }
                 } catch (err) {
                     logger.warn('[ForwardedLinkCapture] Processing failed', { error: err.message });
@@ -6664,6 +7645,52 @@ Returns the group's public invite link if available.`;
             });
         }
 
+        // Handle WA owner assign input
+        if (ctx.session?.sudoAction === 'owner_add') {
+            if (!rbac.hasRolePermission(userRole, 'OWNER')) {
+                return ctx.reply('⚠️ Access denied. Only OWNER can assign WA owners.', { parse_mode: 'HTML' });
+            }
+            ctx.session.sudoAction = null;
+            const phone = text.replace(/[^0-9]/g, '');
+            if (!phone) return ctx.reply('❌ Invalid number.');
+            const jid = `${phone}@s.whatsapp.net`;
+            await ownerManager.addOwner(jid);
+            return ctx.reply(`✅ <b>WA Owner assigned:</b> <code>${jid}</code>\n\n<i>This number now has owner-level access on all nodes.</i>`, {
+                parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '👑 Back to Sudo Menu', callback_data: 'menu_sudo' }]] }
+            });
+        }
+
+        // Handle Global GC Status input
+        if (ctx.session?.awaitingGlobalGcStatus) {
+            if (!rbac.hasRolePermission(userRole, 'OWNER')) {
+                ctx.session.awaitingGlobalGcStatus = false;
+                return ctx.reply('⚠️ Owner only.', { parse_mode: 'HTML' });
+            }
+            ctx.session.awaitingGlobalGcStatus = false;
+            const statusText = text.trim();
+            if (!statusText) return ctx.reply('❌ Empty message. Send the status text.');
+            const statusMsg = await ctx.reply('⏳ Building link preview...', { parse_mode: 'HTML' }).catch(() => null);
+            const cfg = await saveGlobalGcStatus(statusText).catch(() => null);
+            const hasPreview = !!(cfg?.sourceMessage?.extendedTextMessage?.matchedText);
+            const reply = [
+                `✅ <b>Global GC Status saved!</b>`,
+                ``,
+                `🔗 Link preview: <b>${hasPreview ? '✅ Built' : '❌ None (no URL found)'}</b>`,
+                ``,
+                `<b>Preview:</b>`,
+                `<code>${escapeHtml(statusText.slice(0, 300))}</code>`,
+                ``,
+                `<i>Will fire on all nodes when they join a new group.</i>`,
+            ].join('\n');
+            if (statusMsg?.message_id) {
+                await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, reply, {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '🌸 Back to GC Status', callback_data: 'global_gcstatus_menu' }]] }
+                }).catch(() => ctx.reply(reply, { parse_mode: 'HTML' }).catch(() => {}));
+            }
+            return;
+        }
+
         // Handle Set GC Entry Drop (warmup) input
         if (ctx.session?.gcStatusNode) {
             if (!rbac.hasRolePermission(userRole, 'SUDO')) {
@@ -6732,16 +7759,19 @@ Returns the group's public invite link if available.`;
             }
         }
 
-        // Auto-feed WhatsApp links from Telegram to intel autojoin queue
+        // Capture WA links sent directly in Telegram → Main DB
         if (text.includes('chat.whatsapp.com')) {
             try {
-                const { default: intelPlugin } = await Promise.resolve().then(() => ({ default: require('../plugins/pappy-intel') }));
-                const links = text.match(/chat\.whatsapp\.com\/([0-9A-Za-z]{20,24})/ig);
-                if (links?.length) {
-                    // Emit as a fake message.upsert event so intel daemon picks it up
-                    const eventBus = require('./eventBus');
-                    eventBus.emit('message.upsert', { text });
-                    ctx.reply(`📡 <b>${links.length} link(s) queued for auto-join</b>`, { parse_mode: 'HTML' }).catch(() => {});
+                const { addNewCode, getValidatorSummary } = require('./linkValidator');
+                const links = text.match(/chat\.whatsapp\.com\/([0-9A-Za-z]{20,24})/ig) || [];
+                let added = 0;
+                for (const l of links) {
+                    const code = l.split('chat.whatsapp.com/')[1];
+                    if (addNewCode(code, { source: 'telegram_text', addedBy: userId, addedAt: Date.now() }) === 'added') added++;
+                }
+                if (added > 0) {
+                    const s = getValidatorSummary();
+                    ctx.reply(`📥 <b>${added} link(s) added to Main DB</b>\n📥 Main: <b>${s.intake}</b>  ✅ Live: <b>${s.active}</b>`, { parse_mode: 'HTML' }).catch(() => {});
                 }
             } catch {}
         }
@@ -6876,11 +7906,39 @@ Returns the group's public invite link if available.`;
             // Store TG context globally so broadcast can update it
             global._tgBroadcastCtx = { chatId: ctx.chat.id, msgId: statusMsg.message_id };
 
+            // Build link preview for the broadcast message so thumbnail appears in WA
+            // This mimics what happens when a user sends the command directly in WA
+            const broadcastText = text.trim();
+            let broadcastSourceMessage = null;
+            let broadcastSourceContextInfo = null;
+            try {
+                const urls = broadcastText.match(/https?:\/\/[^\s]+/g) || [];
+                if (urls.length > 0) {
+                    const preview = await buildLinkPreview(broadcastText, false).catch(() => null);
+                    if (preview?.externalAdReply) {
+                        broadcastSourceContextInfo = preview;
+                        broadcastSourceMessage = {
+                            extendedTextMessage: {
+                                text: broadcastText,
+                                matchedText: urls[0],
+                                canonicalUrl: urls[0],
+                                ...(preview.externalAdReply?.jpegThumbnail ? { jpegThumbnail: preview.externalAdReply.jpegThumbnail } : {}),
+                                contextInfo: preview,
+                            }
+                        };
+                    }
+                }
+            } catch {}
+
             const broadcastMsg = {
                 key: { remoteJid: botJid, fromMe: false, id: `TG_BCAST_${Date.now()}` },
-                message: { conversation: text },
+                message: broadcastSourceMessage || { conversation: broadcastText },
                 pushName: 'Telegram'
             };
+            // Inject preview into mockMsg so broadcast plugin picks it up
+            if (broadcastSourceMessage) {
+                broadcastMsg.message = broadcastSourceMessage;
+            }
             taskManager.submit(makeTelegramTaskId('TG_EXEC', userId, scoped?.sessionKey), async (abortSignal) => {
                 await targetPlugin.execute({ sock: firstActiveSocket, msg: broadcastMsg, args: text.trim().split(/ +/).slice(1), text, user: mockUserProfile, botId, abortSignal });
                 pushTelegramLiveLog({ sessionKey: activeSessionKey, botId, source: 'BROADCAST', line: `${commandName} queued successfully.` });
@@ -7611,10 +8669,22 @@ Returns the group's public invite link if available.`;
                     try {
                         if (isFolder) {
                             const zipPath = `${filePath}.zip`;
-                            const { execSync } = require('child_process');
-                            execSync(`zip -r "${zipPath}" "${filePath}"`, { timeout: 30000 });
-                            await ctx.replyWithDocument({ source: zipPath, filename: path.basename(zipPath) }).catch(() => {});
-                            fsp.unlink(zipPath).catch(() => {});
+                            const { spawn } = require('child_process');
+                            try {
+                                await new Promise((resolve, reject) => {
+                                    const ps = spawn('zip', ['-r', zipPath, filePath], { stdio: 'ignore' });
+                                    const to = setTimeout(() => {
+                                        try { ps.kill(); } catch (e) {}
+                                        reject(new Error('zip timeout'));
+                                    }, 30000);
+                                    ps.on('error', (err) => { clearTimeout(to); reject(err); });
+                                    ps.on('close', (code) => { clearTimeout(to); if (code === 0) resolve(); else reject(new Error('zip failed: ' + code)); });
+                                });
+
+                                await ctx.replyWithDocument({ source: zipPath, filename: path.basename(zipPath) }).catch(() => {});
+                            } finally {
+                                fsp.unlink(zipPath).catch(() => {});
+                            }
                         } else {
                             await ctx.replyWithDocument({ source: filePath, filename: path.basename(filePath) }).catch(() => {});
                         }
@@ -8191,66 +9261,13 @@ Returns the group's public invite link if available.`;
         if (!isForwarded || !text) return next();
 
         try {
-            // Extract WhatsApp group invite codes from forwarded text
-            const { extractWhatsAppCodes } = require('./telegram/forwardedLinkExtractor');
-            const extracted = extractWhatsAppCodes(text);
-            
-            if (extracted && extracted.length > 0) {
-                // Get any active WhatsApp node to validate links
-                let sock = null;
-                const userId = String(ctx.from?.id || '');
-                const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
-                const scoped = resolveTelegramNodeScope(userId, userRole);
-                if (scoped?.sock) sock = scoped.sock;
-
-                // Store each extracted code in SHARED Intel DB (no botId field - truly global!)
-                for (const code of extracted) {
-                    try {
-                        const doc = await Intel.findOneAndUpdate(
-                            { code },
-                            {
-                                code,
-                                groupName: `WhatsApp Group (${code.slice(0, 8)})`,
-                                groupJid: `group_${code}`,
-                                source: 'telegram_forward',
-                                seenAt: new Date(),
-                                status: 'pending',
-                                members: 0,
-                                // NO botId field — truly SHARED across all nodes!
-                            },
-                            { upsert: true, new: true }
-                        );
-                        
-                        // If we have a socket, validate the link asynchronously
-                        if (sock?.user) {
-                            setImmediate(async () => {
-                                try {
-                                    const { isLinkValid } = require('./linkValidator');
-                                    const isValid = await isLinkValid(`https://chat.whatsapp.com/${code}`, 'invite', sock);
-                                    if (isValid) {
-                                        await Intel.updateOne(
-                                            { code },
-                                            { status: 'valid', validatedAt: new Date() }
-                                        );
-                                    } else {
-                                        await Intel.updateOne(
-                                            { code },
-                                            { status: 'expired', validatedAt: new Date() }
-                                        );
-                                    }
-                                } catch {}
-                            });
-                        }
-                    } catch (e) {
-                        logger.warn('[ForwardedLinkCapture] Failed to store code', { code, error: e.message });
-                    }
-                }
-                
-                // Notify user of captured links
-                await ctx.reply(
-                    `✅ <b>INTEL CAPTURED</b>\n\n📦 Found <b>${extracted.length}</b> WhatsApp group link(s) in forwarded message.\n\n🔗 All links saved to <b>SHARED Intel Database</b> — accessible by all nodes.`,
-                    { parse_mode: 'HTML' }
-                ).catch(() => {});
+            const { processForwardedLinks, formatResultMessage } = require('./telegram/forwardedLinkExtractor');
+            const result = await processForwardedLinks(text, {
+                source: 'telegram_forward',
+                userId: String(ctx.from?.id || ''),
+            });
+            if (result.extracted > 0) {
+                await ctx.reply(formatResultMessage(result), { parse_mode: 'HTML' }).catch(() => {});
             }
         } catch (err) {
             logger.warn('[ForwardedLinkHandler] Error', { error: err.message });
@@ -8262,7 +9279,71 @@ Returns the group's public invite link if available.`;
     process.once('SIGINT', () => bot.stop('SIGINT'));
     process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
-    return bot;
+    // ── AUTO-RESUME Intel Join on socket reconnect ─────────────────────────────────────────────────────────────────────────────────────
+    // When a node comes online (after restart or reconnect), check if it has
+    // an unfinished Intel Join resume file and auto-relaunch the worker.
+    const _autoResumedSessions = new Set();
+    eventBus.on('socket.open', async (sock) => {
+        try {
+            if (!sock?.user) return;
+            const botId = sock.user.id.split(':')[0];
+            // Find the sessionKey for this botId
+            const sessionKey = [...activeSockets.entries()]
+                .find(([k, s]) => s === sock)?.[0] || null;
+            if (!sessionKey) return;
+
+            // Only auto-resume once per session per process lifetime
+            if (_autoResumedSessions.has(sessionKey)) return;
+
+            const resumePath = path.join(__dirname, `../data/intel_join_${sessionKey}.json`);
+            if (!fs.existsSync(resumePath)) return;
+
+            let saved;
+            try { saved = JSON.parse(fs.readFileSync(resumePath, 'utf8')); } catch { return; }
+            if (!saved?.lastIndex && saved?.lastIndex !== 0) return;
+
+            _autoResumedSessions.add(sessionKey);
+
+            // Wait a few seconds for the socket to fully stabilise before joining
+            await new Promise(r => setTimeout(r, 8000));
+
+            // Re-check socket is still online after the wait
+            const liveSock = activeSockets.get(sessionKey);
+            if (!liveSock?.user) return;
+
+            logger.info(`[Intel Join] Auto-resuming ${sessionKey} from index ${saved.lastIndex}`);
+
+            // Notify owner
+            if (global.tgBot && ownerTelegramId) {
+                global.tgBot.telegram.sendMessage(
+                    ownerTelegramId,
+                    `🔄 <b>Intel Join Auto-Resumed</b>\n📱 Node: +${botId}\n📍 Resuming from index <b>${saved.lastIndex}</b>`,
+                    { parse_mode: 'HTML' }
+                ).catch(() => {});
+            }
+
+            // Create a minimal ctx-like object for launchIntelJoinForSession
+            const fakeChatId = Number(ownerTelegramId);
+            const fakeCtx = {
+                chat: { id: fakeChatId },
+                from: { id: ownerTelegramId },
+                state: { userRole: 'OWNER' },
+                answerCbQuery: () => Promise.resolve(),
+                reply: (text, opts) => global.tgBot.telegram.sendMessage(fakeChatId, text, opts || {}).catch(() => null),
+                editMessageText: () => Promise.resolve(),
+                session: {},
+            };
+
+            await launchIntelJoinForSession(fakeCtx, sessionKey, {
+                showNodeMessage: true,
+                backCallback: `node_${sessionKey}`,
+                backLabel: '🔙 Back to Node',
+            }).catch(err => logger.warn(`[Intel Join] Auto-resume failed for ${sessionKey}: ${err.message}`));
+        } catch (err) {
+            logger.warn(`[Intel Join] Auto-resume error: ${err.message}`);
+        }
+    });
+
 }
 
 module.exports = { startTelegram, getMainDashboardMenu };

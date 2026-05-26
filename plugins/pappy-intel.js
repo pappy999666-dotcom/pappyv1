@@ -6,7 +6,34 @@ const path = require('path');
 const { ownerTelegramId } = require('../config');
 const logger  = require('../core/logger');
 const eventBus = require('../core/eventBus');
-const { validateGroupLink, validateBatch, startValidator } = require('../core/linkValidator');
+const {
+    STATUS,
+    DEAD_STATUSES,
+    validateGroupLink,
+    validateBatch,
+    startValidator,
+    getValidatorSummary,
+    getActiveLinks,
+    getJoinableCodes,
+    getDeadLinks,
+    getValidatorEntry,
+    hasValidatorEntry,
+    markLinkActive,
+    markLinkDead,
+    restoreLinkToActive,
+    purgeDeadLink,
+    validateBatchAndAssign,
+    retestDeadLinksWithNode,
+    validateAndAssign,
+    recordJoinOutcome,
+    classifyJoinError,
+    addNewCode,
+    setValidationNode,
+    getValidationNode,
+    resolveValidationSock,
+    isNodePaused,
+    deduplicateIntelDb,
+} = require('../core/linkValidator');
 const Intel = require('../core/models/Intel');
 
 const dbPath = path.join(__dirname, '../data/intel.json');
@@ -57,8 +84,11 @@ function normalizeEntry(entry) {
 }
 
 function hasCode(code) {
-    return intelCache.knownLinks.includes(code) ||
-           intelCache.pendingQueue.some(e => normalizeEntry(e)?.code === code);
+    const normalized = String(code || '').trim();
+    if (!normalized) return false;
+    if (hasValidatorEntry(normalized)) return true;
+    return intelCache.knownLinks.includes(normalized) ||
+           intelCache.pendingQueue.some(e => normalizeEntry(e)?.code === normalized);
 }
 
 function resolveSock(botId) {
@@ -112,35 +142,30 @@ function getBotQueueKey(botId) {
 }
 
 // NEW: Save extracted link to group links mapping with validation
-async function addGroupLink(groupJid, code, sock = null) {
+function addGroupLink(groupJid, code) {
+    // Routes through addNewCode — enforces global dedup, enters INTAKE pipeline
     if (!groupJid || !code) return false;
     const jid = String(groupJid).trim();
+    const c = String(code).trim();
+
+    // Track in groupLinks map for context (which group this link came from)
     if (!intelCache.groupLinks[jid]) intelCache.groupLinks[jid] = [];
-    
-    // Check if already exists (duplicate prevention)
-    const existing = intelCache.groupLinks[jid].find(l => l.code === code);
+    const existing = intelCache.groupLinks[jid].find(l => l.code === c);
     if (existing) {
         existing.seenAt = Date.now();
-        return false; // already tracked
+        // Still try addNewCode in case it wasn't in validator yet
+        addNewCode(c, { source: 'wa_group_scrape', groupJid: jid, scrapedAt: Date.now() });
+        return false;
     }
-    
-    // Validate link before saving using our validator
-    const validation = await validateGroupLink(code, sock).catch(err => ({ valid: false, error: err.message }));
-    
-    if (validation.valid) {
-        intelCache.groupLinks[jid].push({
-            code,
-            validatedAt: Date.now(),
-            status: 'valid',
-            seenAt: Date.now(),
-        });
-        await upsertSharedIntel(code, {
-            status: 'valid',
-            source: 'group_link_detected',
-            groupJid: jid,
-            validatedAt: new Date(),
-        });
-        await saveState();
+
+    // Add to groupLinks map
+    intelCache.groupLinks[jid].push({ code: c, seenAt: Date.now(), status: STATUS.INTAKE });
+
+    // Route through validator pipeline — addNewCode handles dedup globally
+    const outcome = addNewCode(c, { source: 'wa_group_scrape', groupJid: jid, scrapedAt: Date.now() });
+    if (outcome === 'added') {
+        logger.info(`[INTEL] New link ${c} from group ${jid} → INTAKE`);
+        saveState().catch(() => {});
         return true;
     }
     return false;
@@ -157,11 +182,23 @@ async function cleanupGroupInvalidLinks(groupJid, sock = null) {
     const codesToCheck = links.map(l => l.code);
     const { valid } = await validateBatch(codesToCheck, sock).catch(() => ({ valid: [] }));
     
-    const newLinks = links.filter(link => {
+    const newLinks = [];
+    for (const link of links) {
         const keep = valid.includes(link.code);
-        if (!keep) removed++;
-        return keep;
-    });
+        if (!keep) {
+            removed++;
+            const deadCode = String(link.code || '').trim();
+            if (deadCode) {
+                await markLinkDead(deadCode, {
+                    source: 'cleanupGroupInvalidLinks',
+                    groupJid: jid,
+                    validatedAt: new Date(),
+                }).catch(() => {});
+            }
+        } else {
+            newLinks.push(link);
+        }
+    }
     
     if (removed > 0) {
         intelCache.groupLinks[jid] = newLinks;
@@ -182,7 +219,26 @@ async function initDb() {
         }
     } catch {}
 }
+
+async function validatePendingQueueAfterLoad() {
+    const entries = (intelCache.pendingQueue || []).map(normalizeEntry).filter(Boolean);
+    if (!entries.length) return;
+
+    // Route existing pendingQueue entries through the validator intake (do not join from pendingQueue)
+    for (const entry of entries) {
+        try {
+            addNewCode(entry.code, { source: 'pending_queue_migration', queuedAt: entry.queuedAt || Date.now(), botId: entry.botId || null });
+        } catch (e) {}
+    }
+    // clear legacy pendingQueue — validator takes over
+    intelCache.pendingQueue = [];
+    await saveState().catch(() => {});
+}
+
 initDb();
+setImmediate(() => {
+    validatePendingQueueAfterLoad().catch(() => {});
+});
 
 async function syncLegacyIntelCacheToMongo() {
     const codes = Array.isArray(intelCache.knownLinks) ? intelCache.knownLinks : [];
@@ -207,6 +263,42 @@ setImmediate(() => {
     syncLegacyIntelCacheToMongo().catch(() => {});
 });
 
+// React to validator commits so the join engine's caches stay in sync immediately
+eventBus.on('validator.commit', async ({ code, outcome, bucket }) => {
+    try {
+        if (!code) return;
+        const c = String(code).trim();
+
+        // Remove from knownLinks if it moved to dead
+        if (bucket === 'dead') {
+            intelCache.knownLinks = (intelCache.knownLinks || []).filter(x => String(x || '') !== c);
+        }
+
+        // Remove from pendingQueue so we don't try to join a link that was just classified dead
+        if (Array.isArray(intelCache.pendingQueue)) {
+            intelCache.pendingQueue = intelCache.pendingQueue.filter(e => {
+                const cc = normalizeEntry(e)?.code;
+                return cc && String(cc) !== c;
+            });
+        }
+
+        // Remove from any groupLinks mapping
+        if (intelCache.groupLinks && typeof intelCache.groupLinks === 'object') {
+            for (const jid of Object.keys(intelCache.groupLinks)) {
+                const arr = intelCache.groupLinks[jid] || [];
+                const filtered = arr.filter(l => String(l?.code || '') !== c);
+                if (filtered.length !== arr.length) intelCache.groupLinks[jid] = filtered;
+            }
+        }
+
+        // Persist intel.json state quickly
+        await saveState().catch(() => {});
+        logger.info(`[INTEL] Validator commit synced: ${c} → ${bucket || outcome}`);
+    } catch (err) {
+        logger.warn(`[INTEL] Failed handling validator.commit: ${err.message}`);
+    }
+});
+
 // Start link validator on initialization
 setImmediate(() => {
     try {
@@ -219,56 +311,68 @@ setImmediate(() => {
 // Listen for socket open to set up group join handlers
 eventBus.on('socket.open', (sock) => {
     if (!sock || !sock.ev) return;
-    
-    // Listen for group participant updates (joins/leaves)
-    sock.ev.on('group-participants.update', async (groupParticipantsUpdate) => {
+
+    const botId = sock.user?.id?.split(':')[0] || '';
+
+    // When bot joins a group — fetch its invite link and add to Main for validation
+    sock.ev.on('group-participants.update', async ({ id, action, participants }) => {
         try {
-            const { id, action, participants } = groupParticipantsUpdate;
-            if (!id || !participants || !participants.length) return;
-            
-            // Only care about 'add' actions (new joins)
-            if (action !== 'add') return;
-            
-            const groupJid = id;
-            
-            for (const participant of participants) {
-                const participantJid = String(participant || '').trim();
-                if (!participantJid) continue;
-                
-                // Check if this is the bot joining
-                const isBot = sock.user?.id && participantJid.includes(sock.user.id.split(':')[0]);
-                
-                if (isBot) {
-                    logger.success(`[INTEL] Bot joined group ${groupJid}`);
-                    
-                    // Send telegram notification about successful group join
-                    if (global.tgBot) {
-                        try {
-                            // Get group metadata
-                            const meta = await sock.groupMetadata(groupJid).catch(() => null);
-                            const groupName = meta?.subject || groupJid;
-                            const memberCount = meta?.participants?.length || '?';
-                            
-                            global.tgBot.telegram.sendMessage(
-                                ownerTelegramId,
-                                `🎉 <b>GROUP JOIN SUCCESSFUL</b>\n\n` +
-                                `👥 <b>${escapeHtml(groupName)}</b>\n` +
-                                `📱 Members: ${memberCount}\n` +
-                                `🆔 <code>${groupJid}</code>\n` +
-                                `⏰ <i>${new Date().toLocaleString()}</i>`,
-                                { parse_mode: 'HTML' }
-                            ).catch(() => {});
-                        } catch (err) {
-                            logger.warn(`[INTEL] Failed to notify telegram of group join: ${err.message}`);
-                        }
+            if (!id || !participants?.length || action !== 'add') return;
+            const isBot = botId && participants.some(p => String(p).includes(botId));
+            if (!isBot) return;
+
+            logger.success(`[INTEL] Bot joined group ${id}`);
+
+            // Fetch invite link and ingest into Main DB
+            setTimeout(async () => {
+                try {
+                    const code = await sock.groupInviteCode(id).catch(() => null);
+                    if (code) {
+                        const result = addNewCode(code, { source: 'group_join_scrape', groupJid: id, botId, scrapedAt: Date.now() });
+                        if (result === 'added') logger.info(`[INTEL] Group join scraped ${code} → Main`);
                     }
-                }
+                } catch {}
+            }, 3000);
+
+            // Telegram notification
+            if (global.tgBot && ownerTelegramId) {
+                const meta = await sock.groupMetadata(id).catch(() => null);
+                const groupName = meta?.subject || id;
+                const memberCount = meta?.participants?.length || '?';
+                global.tgBot.telegram.sendMessage(
+                    ownerTelegramId,
+                    `🎉 <b>GROUP JOIN SUCCESSFUL</b>\n\n` +
+                    `👥 <b>${escapeHtml(groupName)}</b>\n` +
+                    `📱 Members: ${memberCount}\n` +
+                    `🆔 <code>${id}</code>`,
+                    { parse_mode: 'HTML' }
+                ).catch(() => {});
             }
         } catch (err) {
-            logger.warn(`[INTEL] Error handling group join: ${err.message}`);
+            logger.warn(`[INTEL] group-participants.update error: ${err.message}`);
         }
     });
-});;
+
+    // Passive scraper — always on, no toggle needed
+    // Catches any WA invite link seen in any message on this node
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        for (const msg of (messages || [])) {
+            try {
+                const text = msg.message?.conversation
+                    || msg.message?.extendedTextMessage?.text
+                    || msg.message?.imageMessage?.caption
+                    || msg.message?.videoMessage?.caption
+                    || '';
+                if (!text?.includes('chat.whatsapp.com')) continue;
+                const matches = text.match(/chat\.whatsapp\.com\/([0-9A-Za-z]{20,24})/ig) || [];
+                for (const m of matches) {
+                    const code = m.split('chat.whatsapp.com/')[1];
+                    if (code) addNewCode(code, { source: 'passive_scrape', botId, groupJid: msg.key?.remoteJid || null, scrapedAt: Date.now() });
+                }
+            } catch {}
+        }
+    });
+});
 
 function checkDailyReset() {
     const today = new Date().toISOString().split('T')[0];
@@ -350,282 +454,65 @@ function getBotJoinState(botKey) {
 // ── Scraper: intercept invite links from any message ─────────────────────────
 let _linkQueueNotificationThrottle = {};
 
-eventBus.on('message.upsert', async ({ sock, msg, text, botId }) => {
+// ── Passive link scraper (always on, no toggle) ──────────────────────────────
+// Catches every WA invite link seen in any message on any node → Main DB
+let _notifThrottle = 0;
+eventBus.on('message.upsert', ({ msg, text, botId }) => {
     if (!text?.includes('chat.whatsapp.com')) return;
     const matches = text.match(/chat\.whatsapp\.com\/([0-9A-Za-z]{20,24})/ig) || [];
+    const groupJid = msg?.key?.remoteJid || null;
+    const nodeId   = String(botId || '').trim() || null;
     let added = 0;
-    const newCodes = [];
-    
-    // Try to get the group JID where this message was received
-    const groupJid = msg?.key?.remoteJid;
-    
     for (const m of matches) {
         const code = m.split('chat.whatsapp.com/')[1];
-        newCodes.push(code);
-
-        // ENHANCED: Also save link to groupLinks with validation
-        if (groupJid) {
-            const saved = await addGroupLink(groupJid, code, sock).catch(() => false);
-            if (saved) {
-                logger.info(`[INTEL] Saved link ${code} to group ${groupJid}`);
-            }
-        }
-
-        // Real-time autojoin — immediately join without queuing
-        if (intelCache.realtimeAutoJoin && sock && canUseRealtimeJoin()) {
-            try {
-                if (hasCode(code)) continue;
-                const joinedJid = await sock.groupAcceptInvite(code);
-                logger.info(`[INTEL] Real-time joined: ${code}`);
-                if (!intelCache.knownLinks.includes(code)) {
-                    intelCache.knownLinks.push(code);
-                }
-                
-                // Send telegram notification immediately on join
-                if (global.tgBot && ownerTelegramId) {
-                    const meta = await sock.groupMetadata(joinedJid).catch(() => null);
-                    const groupName = meta?.subject || 'Unknown Group';
-                    global.tgBot.telegram.sendMessage(
-                        ownerTelegramId,
-                        `✅ <b>AUTO-JOIN SUCCESS</b>\n\n` +
-                        `👥 <b>${escapeHtml(groupName)}</b>\n` +
-                        `🔗 <code>${code}</code>\n` +
-                        `📊 Total joined: <b>${intelCache.dailyJoins}/${LIMITS.MAX_JOINS_PER_DAY}</b>`,
-                        { parse_mode: 'HTML' }
-                    ).catch(() => {});
-                }
-                intelCache.dailyJoins++;
-                intelCache.realtimeWindowCount = Number(intelCache.realtimeWindowCount || 0) + 1;
-                intelCache.lastJoinTimestamp = Date.now();
-                intelCache.consecutiveFails = 0;
-                await upsertSharedIntel(code, {
-                    status: 'joined',
-                    source: 'autojoin_realtime',
-                    validatedAt: new Date(),
-                });
-                await saveState();
-            } catch (e) {
-                logger.warn(`[INTEL] Real-time join failed for ${code}: ${e.message}`);
-                intelCache.consecutiveFails = Number(intelCache.consecutiveFails || 0) + 1;
-                const lower = String(e.message || '').toLowerCase();
-                if (lower.includes('rate') || lower.includes('429') || lower.includes('too many') || lower.includes('spam')) {
-                    intelCache.rateLimitHits = Number(intelCache.rateLimitHits || 0) + 1;
-                }
-                if (
-                    Number(intelCache.rateLimitHits || 0) >= LIMITS.MAX_RATE_LIMIT_HITS ||
-                    Number(intelCache.consecutiveFails || 0) >= LIMITS.MAX_CONSECUTIVE_FAILS
-                ) {
-                    triggerEmergencyPause(`realtime failures=${intelCache.consecutiveFails} rateHits=${intelCache.rateLimitHits}`);
-                }
-                // Fallback: queue this fresh link only if real-time join failed.
-                if (!hasCode(code)) {
-                    intelCache.pendingQueue.push({
-                        code,
-                        botId: String(botId || '').trim() || null,
-                        queuedAt: Date.now(),
-                    });
-                    added++;
-                }
-            }
-            continue;
-        }
-
-        if (!hasCode(code)) {
-            intelCache.pendingQueue.push({
-                code,
-                botId: String(botId || '').trim() || null,
-                queuedAt: Date.now(),
-            });
-            added++;
-        }
+        const r = addNewCode(code, { source: 'passive_scrape', botId: nodeId, groupJid, scrapedAt: Date.now() });
+        if (r === 'added') { added++; if (groupJid) addGroupLink(groupJid, code); }
     }
-    
     if (added > 0) {
-        await saveState();
-        logger.info(`[INTEL] Queued ${added} new link(s). Queue: ${intelCache.pendingQueue.length}`);
-        
-        // Send telegram notification for queued links (throttled to once per 30 seconds)
-        const throttleKey = `queue_notification`;
-        const lastNotif = _linkQueueNotificationThrottle[throttleKey] || 0;
-        if (Date.now() - lastNotif > 30000 && global.tgBot && ownerTelegramId) {
-            _linkQueueNotificationThrottle[throttleKey] = Date.now();
-            global.tgBot.telegram.sendMessage(
-                ownerTelegramId,
-                `📡 <b>${added} link(s) queued for auto-join</b>\n\n` +
-                `⏳ Queue size: <b>${intelCache.pendingQueue.length}</b>\n` +
-                `⚙️ Auto-join: ${intelCache.autoJoinEnabled ? '🟢 ACTIVE' : '🔴 INACTIVE'}`,
-                { parse_mode: 'HTML' }
-            ).catch(() => {});
+        saveState().catch(() => {});
+        const now = Date.now();
+        if (now - _notifThrottle > 60000 && global.tgBot && ownerTelegramId) {
+            _notifThrottle = now;
+            const s = getValidatorSummary();
+            global.tgBot.telegram.sendMessage(ownerTelegramId,
+                `📡 <b>Link Collector</b>\n\nNew: <b>${added}</b>\n📥 Main: <b>${s.intake}</b>  ✅ Live: <b>${s.active}</b>`,
+                { parse_mode: 'HTML' }).catch(() => {});
         }
     }
 });
 
-// ── Auto-joiner daemon ────────────────────────────────────────────────────────
+// ── Auto-joiner daemon ────────────────────────────────────────────
+// DISABLED: Join Intel (Telegram menu) is now the primary join system.
+// processQueue is kept for reference but the interval is not started.
+// To re-enable, uncomment the setInterval below.
 async function processQueue(botId = null) {
-    if (!intelCache.autoJoinEnabled || !intelCache.pendingQueue.length) return;
-    if (inEmergencyPause()) return;
-    // When real-time mode is enabled, never drain historical queue items.
-    if (intelCache.realtimeAutoJoin) return;
-    checkDailyReset();
-
-    const botKey = getBotQueueKey(botId);
-    const botJoinState = getBotJoinState(botKey);
-    if (botJoinState.dailyJoins >= LIMITS.MAX_JOINS_PER_DAY) return;
-
-    const now = Date.now();
-    const cooldown = LIMITS.MIN_COOLDOWN_MS + Math.random() * (LIMITS.MAX_COOLDOWN_MS - LIMITS.MIN_COOLDOWN_MS);
-    if (now - Number(botJoinState.lastJoinTimestamp || 0) < cooldown) return;
-
-    const startAt = Number(intelCache.autoJoinStartedAt) || 0;
-    if (_processingByBot.get(botKey)) return;
-
-    let queueIndex = -1;
-    let entry = null;
-    for (let i = 0; i < intelCache.pendingQueue.length; i++) {
-        const candidate = normalizeEntry(intelCache.pendingQueue[i]);
-        if (!candidate) continue;
-        if (getBotQueueKey(candidate.botId) !== botKey) continue;
-        if (candidate.queuedAt >= startAt) {
-            queueIndex = i;
-            entry = candidate;
-            break;
-        }
-    }
-
-    if (!entry) return;
-
-    const sock = resolveSock(entry.botId || intelCache.autoJoinBotId);
-    if (!sock) return;
-
-    _processingByBot.set(botKey, true);
-    intelCache.pendingQueue.splice(queueIndex, 1);
-    intelCache.knownLinks.push(entry.code);
-
-    try {
-        await new Promise(r => setTimeout(r, 1500 + Math.random() * 2000));
-
-        let joined = false;
-        let groupJid = null;
-
-        try {
-            groupJid = await sock.groupAcceptInvite(entry.code);
-            joined = true;
-        } catch (e) {
-            const msg = String(e.message || '').toLowerCase();
-            if (msg.includes('approval') || msg.includes('request') || msg.includes('admin') || msg.includes('not-acceptable')) {
-                try {
-                    const info = await sock.groupGetInviteInfo(entry.code).catch(() => null);
-                    if (info?.id) {
-                        await sock.groupAcceptInviteV4(sock.user.id, {
-                            groupJid: info.id,
-                            inviteCode: entry.code,
-                            inviteExpiration: info.inviteExpiration || 0
-                        });
-                        groupJid = info.id;
-                        joined = true;
-                        logger.info(`[INTEL] Join request sent to ${info.subject || info.id}`);
-                    }
-                } catch {}
-            }
-            if (!joined) throw e;
-        }
-
-        botJoinState.dailyJoins = Number(botJoinState.dailyJoins || 0) + 1;
-        botJoinState.lastJoinTimestamp = Date.now();
-        intelCache.botJoinState[botKey] = botJoinState;
-
-        intelCache.dailyJoins++;
-        intelCache.lastJoinTimestamp = botJoinState.lastJoinTimestamp;
-        intelCache.consecutiveFails = 0;
-        await upsertSharedIntel(entry.code, {
-            status: 'joined',
-            source: 'autojoin_queue',
-            groupJid: groupJid || '',
-            validatedAt: new Date(),
-        });
-        saveState();
-
-        const display = groupJid || entry.code;
-        logger.success(`[INTEL] Joined: ${display} (${intelCache.dailyJoins}/${LIMITS.MAX_JOINS_PER_DAY})`);
-
-        if (global.tgBot && ownerTelegramId) {
-            try {
-                const meta = await sock.groupMetadata(groupJid).catch(() => null);
-                const groupName = meta?.subject || 'Unknown Group';
-                const memberCount = meta?.participants?.length || '?';
-
-                global.tgBot.telegram.sendMessage(
-                    ownerTelegramId,
-                    `✅ <b>AUTO-JOIN SUCCESSFUL</b>\n\n` +
-                    `👥 <b>${escapeHtml(groupName)}</b>\n` +
-                    `🔗 <code>${entry.code}</code>\n` +
-                    `👤 Members: <b>${memberCount}</b>\n` +
-                    `📊 Today: <b>${intelCache.dailyJoins}/${LIMITS.MAX_JOINS_PER_DAY}</b>\n` +
-                    `📋 Queue remaining: <b>${intelCache.pendingQueue.length}</b>`,
-                    { parse_mode: 'HTML' }
-                ).catch(() => {});
-            } catch (err) {
-                logger.warn(`[INTEL] Failed to notify telegram: ${err.message}`);
-            }
-        }
-    } catch (err) {
-        logger.warn(`[INTEL] Failed ${entry.code}: ${err.message}`);
-        intelCache.consecutiveFails = Number(intelCache.consecutiveFails || 0) + 1;
-        const lower = String(err.message || '').toLowerCase();
-        if (lower.includes('rate') || lower.includes('429') || lower.includes('too many') || lower.includes('spam')) {
-            intelCache.rateLimitHits = Number(intelCache.rateLimitHits || 0) + 1;
-        }
-        if (
-            Number(intelCache.rateLimitHits || 0) >= LIMITS.MAX_RATE_LIMIT_HITS ||
-            Number(intelCache.consecutiveFails || 0) >= LIMITS.MAX_CONSECUTIVE_FAILS
-        ) {
-            triggerEmergencyPause(`queue failures=${intelCache.consecutiveFails} rateHits=${intelCache.rateLimitHits}`);
-        }
-        botJoinState.lastJoinTimestamp = Date.now() - (LIMITS.MAX_COOLDOWN_MS - 5000);
-        intelCache.botJoinState[botKey] = botJoinState;
-        intelCache.lastJoinTimestamp = botJoinState.lastJoinTimestamp;
-        saveState();
-    } finally {
-        _processingByBot.delete(botKey);
-    }
+    // Disabled — use Join Intel from Telegram node menu instead
+    return;
 }
-
-// Run every 5s — faster than before (was 10s)
-setInterval(() => {
-    const botKeys = new Set();
-    if (intelCache.autoJoinBotId) botKeys.add(getBotQueueKey(intelCache.autoJoinBotId));
-    for (const item of intelCache.pendingQueue) {
-        const candidate = normalizeEntry(item);
-        if (candidate?.botId) botKeys.add(getBotQueueKey(candidate.botId));
-    }
-    if (!botKeys.size) botKeys.add(getBotQueueKey(null));
-    for (const botKey of botKeys) {
-        processQueue(botKey).catch(() => {});
-    }
-}, 5000).unref();
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 module.exports = {
     category: 'INTEL',
     commands: [
-        { cmd: '.autojoin',  role: 'owner' },
-        { cmd: '.joinqueue', role: 'owner' },
-        { cmd: '.intelclean', role: 'owner' },
+        { cmd: '.autojoin',    role: 'owner' },
+        { cmd: '.joinqueue',   role: 'owner' },
+        { cmd: '.intelclean',  role: 'owner' },
+        { cmd: '.validnode',   role: 'owner' },
+        { cmd: '.validstatus', role: 'owner' },
     ],
 
     execute: async ({ sock, msg, args, text, botId }) => {
         const jid = msg.key.remoteJid;
         const cmd = text.split(' ')[0].toLowerCase();
 
+        // ── .autojoin ──────────────────────────────────────────────────────────
         if (cmd === '.autojoin') {
             const action = args[0]?.toLowerCase();
             const sub = args[1]?.toLowerCase();
 
             if (action === 'realtime') {
                 if (sub !== 'on' && sub !== 'off') {
-                    return sock.sendMessage(jid, {
-                        text: '⚙️ Usage: .autojoin realtime on/off'
-                    }, { quoted: msg });
+                    return sock.sendMessage(jid, { text: '⚙️ Usage: .autojoin realtime on/off' }, { quoted: msg });
                 }
                 intelCache.realtimeAutoJoin = sub === 'on';
                 saveState();
@@ -636,14 +523,12 @@ module.exports = {
 
             if (action === 'on' || action === 'off') {
                 intelCache.autoJoinEnabled = action === 'on';
-                intelCache.autoJoinBotId   = intelCache.autoJoinEnabled
+                intelCache.autoJoinBotId = intelCache.autoJoinEnabled
                     ? String(botId || sock?.user?.id?.split(':')[0] || '').trim() || null
                     : null;
-                // Safety default: queue mode only. Realtime joins are opt-in.
                 intelCache.realtimeAutoJoin = false;
                 if (intelCache.autoJoinEnabled) {
                     intelCache.autoJoinStartedAt = Date.now();
-                    // Drop stale pending links so autojoin acts on newly sent links only.
                     intelCache.pendingQueue = [];
                 }
                 saveState();
@@ -651,60 +536,115 @@ module.exports = {
                     text: `📡 *AUTO-JOIN:* ${intelCache.autoJoinEnabled ? 'ENGAGED 🟢' : 'OFFLINE 🔴'}\n⚡ Real-time join: ${intelCache.realtimeAutoJoin ? 'ON' : 'OFF'}\n📋 Queue: ${intelCache.pendingQueue.length} links`
                 }, { quoted: msg });
             }
+
             return sock.sendMessage(jid, {
                 text: `⚙️ Auto-Join: ${intelCache.autoJoinEnabled ? 'ENGAGED 🟢' : 'OFFLINE 🔴'}\nUsage:\n• .autojoin on/off\n• .autojoin realtime on/off`
             }, { quoted: msg });
         }
 
+        // ── .joinqueue ─────────────────────────────────────────────────────────
         if (cmd === '.joinqueue') {
             checkDailyReset();
-            // Show first 5 queued codes
             const preview = intelCache.pendingQueue.slice(0, 5)
                 .map((e, i) => `${i + 1}. ${normalizeEntry(e)?.code || '?'}`)
                 .join('\n') || '_Empty_';
-            
-            // Count stored links across all groups
             let totalStoredLinks = 0;
             for (const links of Object.values(intelCache.groupLinks || {})) {
                 totalStoredLinks += Array.isArray(links) ? links.length : 0;
             }
-
+            const summary = getValidatorSummary();
             return sock.sendMessage(jid, {
                 text: `📡 *INTEL QUEUE*\n\n` +
                       `⏳ Pending: *${intelCache.pendingQueue.length}*\n` +
                       `💾 Stored links: *${totalStoredLinks}* across groups\n` +
                       `✅ Joined today: *${intelCache.dailyJoins}/${LIMITS.MAX_JOINS_PER_DAY}*\n` +
-                      `⚙️ Status: ${intelCache.autoJoinEnabled ? 'ENGAGED 🟢' : 'OFFLINE 🔴'}\n\n` +
+                      `⚙️ Status: ${intelCache.autoJoinEnabled ? 'ENGAGED 🟢' : 'OFFLINE 🔴'}\n` +
+                      `🔗 Validator active: *${summary.active}* | dead: *${summary.dead}*\n\n` +
                       `*Next up:*\n${preview}\n\n` +
-                      `<code>.intelclean</code> to validate & remove dead links`
+                      `Use *.intelclean* to dedup & clean dead links`
             }, { quoted: msg });
         }
-        
+
+        // ── .intelclean ────────────────────────────────────────────────────────
         if (cmd === '.intelclean') {
             try {
-                await sock.sendMessage(jid, {
-                    text: `🔍 *Validating & cleaning intel DB...*`
-                }, { quoted: msg });
-                
-                let totalCleaned = 0;
-                const groupJids = Object.keys(intelCache.groupLinks || {});
-                
-                for (const groupJid of groupJids) {
-                    const removed = await cleanupGroupInvalidLinks(groupJid, sock).catch(() => 0);
-                    totalCleaned += removed;
-                }
-                
+                await sock.sendMessage(jid, { text: `🔍 *Deduplicating & cleaning intel DB...*` }, { quoted: msg });
+
+                // Step 1: dedup intel.json
+                const { deduped } = await deduplicateIntelDb().catch(() => ({ deduped: 0 }));
+
+                // Step 2: retest dead links with metadata pre-screen
+                const deadRetest = await retestDeadLinksWithNode(sock).catch(() => []);
+                const restored = deadRetest.filter(i => i.restored).length;
+                const stillDead = deadRetest.filter(i => !i.restored).length;
+
+                const summary = getValidatorSummary();
+
                 return sock.sendMessage(jid, {
                     text: `✅ *INTEL CLEANED*\n\n` +
-                          `🗑 Removed: *${totalCleaned}* dead link(s)\n` +
-                          `💾 Groups scanned: *${groupJids.length}*\n` +
-                          `📊 Remaining valid: *${Object.values(intelCache.groupLinks || {}).reduce((s, l) => s + (Array.isArray(l) ? l.length : 0), 0)}*`
+                          `🧽 Duplicates removed: *${deduped}*\n` +
+                          `🔄 Dead links retested: *${deadRetest.length}*\n` +
+                          `♻️ Restored to active: *${restored}*\n` +
+                          `🛑 Still dead: *${stillDead}*\n\n` +
+                          `📊 Validator: *${summary.active}* active | *${summary.dead}* dead`
                 }, { quoted: msg });
             } catch (err) {
+                return sock.sendMessage(jid, { text: `❌ Cleanup failed: ${err.message}` }, { quoted: msg });
+            }
+        }
+
+        // ── .validnode ─────────────────────────────────────────────────────────
+        // Assign a specific node as the validation node (ban risk isolation)
+        if (cmd === '.validnode') {
+            const sub = args[0]?.toLowerCase();
+
+            if (sub === 'set') {
+                // Use the current node (the one that received this command)
+                const nodeId = String(sock.user?.id?.split(':')[0] || botId || '');
+                if (!nodeId) return sock.sendMessage(jid, { text: '❌ Could not determine node ID.' }, { quoted: msg });
+                setValidationNode(nodeId);
                 return sock.sendMessage(jid, {
-                    text: `❌ Cleanup failed: ${err.message}`
+                    text: `🔗 *Validation node set to:* +${nodeId}\n\nThis node will be used for join-based validation.\nBan risk is now isolated to this node.`
                 }, { quoted: msg });
             }
+
+            if (sub === 'clear') {
+                setValidationNode(null);
+                return sock.sendMessage(jid, { text: '✅ Validation node cleared. Any connected node will be used.' }, { quoted: msg });
+            }
+
+            const current = getValidationNode();
+            return sock.sendMessage(jid, {
+                text: `🔗 *Validation Node*\n\n` +
+                      `Current: *${current ? '+' + current : 'auto (any node)'}*\n\n` +
+                      `Usage:\n• *.validnode set* — assign this node\n• *.validnode clear* — use any node`
+            }, { quoted: msg });
+        }
+
+        // ── .validstatus ───────────────────────────────────────────────────────
+        // Full validator status report
+        if (cmd === '.validstatus') {
+            const summary = getValidatorSummary();
+            const byStatus = Object.entries(summary.byStatus || {})
+                .map(([s, n]) => `  ${s}: ${n}`)
+                .join('\n') || '  (none)';
+            const paused = summary.pausedNodes.length
+                ? summary.pausedNodes.map(n => `  +${n.id} (resumes in ${n.resumesIn})`).join('\n')
+                : '  none';
+
+            checkDailyReset();
+            return sock.sendMessage(jid, {
+                text: `📊 *VALIDATOR STATUS*\n\n` +
+                      `🔗 Validation node: *${summary.validationNode}*\n` +
+                      `✅ Active links: *${summary.active}*\n` +
+                      `🛑 Dead links: *${summary.dead}*\n\n` +
+                      `*Status breakdown:*\n${byStatus}\n\n` +
+                      `*Flood-paused nodes:*\n${paused}\n\n` +
+                      `*Auto-join:* ${intelCache.autoJoinEnabled ? 'ON 🟢' : 'OFF 🔴'}\n` +
+                      `*Joined today:* ${intelCache.dailyJoins}/${LIMITS.MAX_JOINS_PER_DAY}\n` +
+                      `*Consecutive fails:* ${intelCache.consecutiveFails}\n` +
+                      `*Emergency pause:* ${inEmergencyPause() ? '🛑 ACTIVE' : '✅ clear'}`
+            }, { quoted: msg });
         }
     }
 };

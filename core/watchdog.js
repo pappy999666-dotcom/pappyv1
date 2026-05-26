@@ -70,6 +70,15 @@ class SmartWatchdog {
             }
 
             if (idle > this.timeoutMs) {
+                // GUARD: check coordination gate before firing reconnect
+                const kernel = (() => { try { return require('./runtimeKernel').getKernel(); } catch { return null; } })();
+                const alreadyReconnecting = kernel?.healthMonitor?.canReconnect
+                    ? !kernel.healthMonitor.canReconnect(botId)
+                    : false;
+                if (alreadyReconnecting) {
+                    logger.info(`[WATCHDOG] Zombie detected: ${botId} but reconnect already in progress — skipping duplicate`);
+                    return;
+                }
                 logger.error(`[WATCHDOG] Zombie detected: ${botId} (idle ${Math.round(idle / 1000)}s). Restarting...`);
                 this.detach(botId);
                 try { m.restartCallback(); } catch (e) { logger.error(`[WATCHDOG] Restart callback failed for ${botId}: ${e.message}`); }
@@ -111,9 +120,19 @@ class SmartWatchdog {
                     logger.warn(`[WATCHDOG] Session ${sessionKey} silent for ${Math.round(silent/60000)}min — pinging (strike ${count})`);
                     try { sock.ws?.ping?.(); } catch {}
                     if (count >= SILENCE_ESCALATE_COUNT) {
-                        logger.error(`[WATCHDOG] Session ${sessionKey} still silent after ${count} checks — forcing reconnect`);
-                        this.silentCounts.set(sessionKey, 0);
-                        try { sock.ws?.close?.(); } catch {}
+                        // GUARD: check coordination gate before forcing reconnect
+                        const kernel = (() => { try { return require('./runtimeKernel').getKernel(); } catch { return null; } })();
+                        const alreadyReconnecting = kernel?.healthMonitor?.canReconnect
+                            ? !kernel.healthMonitor.canReconnect(sessionKey)
+                            : false;
+                        if (!alreadyReconnecting) {
+                            logger.error(`[WATCHDOG] Session ${sessionKey} still silent after ${count} checks — forcing reconnect`);
+                            this.silentCounts.set(sessionKey, 0);
+                            try { sock.ws?.close?.(); } catch {}
+                        } else {
+                            logger.info(`[WATCHDOG] Session ${sessionKey} silent but reconnect already in progress — skipping duplicate`);
+                            this.silentCounts.set(sessionKey, 0);
+                        }
                     }
                 } else {
                     this.silentCounts.set(sessionKey, 0);
