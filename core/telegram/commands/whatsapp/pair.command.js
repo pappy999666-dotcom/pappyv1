@@ -13,7 +13,8 @@ module.exports = {
     async handler({ ctx, args, deps }) {
         const { startWhatsApp, activeSockets, ownerTelegramId, botState, ownerManager } = deps;
         const tgId = String(ctx.from?.id || '');
-        if (!tgId) return ctx.reply('⚠️ Unable to identify sender.', { parse_mode: 'HTML' });
+        const chatId = String(ctx.chat?.id || ctx.from?.id || '');
+        if (!tgId || !chatId) return ctx.reply('⚠️ Unable to identify sender.', { parse_mode: 'HTML' });
 
         // Check if auto-pair is enabled
         if (!botState.autoPairEnabled && String(tgId) !== String(ownerTelegramId)) {
@@ -59,7 +60,7 @@ module.exports = {
 
         await ctx.reply(`⚙️ <b>INITIALIZING STEALTH LINK...</b>\n\n📱 <code>+${phone}</code>\n<i>Please wait for your pairing code...</i>`, { parse_mode: "HTML" });
         try {
-            await startWhatsApp(tgId, phone, "1");
+            await startWhatsApp(chatId, phone, "1", false, 0, tgId);
             await pairingRegistry.register(tgId, phone).catch(() => {});
         } catch (err) {
             const msg = err?.message || String(err);

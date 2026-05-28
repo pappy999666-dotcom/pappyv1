@@ -104,15 +104,18 @@ class SmartWatchdog {
             if (global.gc) global.gc();
         }
 
-        // Self-healing: restart silent sockets that haven't received messages in 10 min
-        // but only if they were previously active (have a monitor)
+        // Self-healing: restart sockets that are truly dead (no WS pong + no messages)
+        // IMPORTANT: use _openedAt as baseline so fresh sessions aren't killed before any message arrives
         const now = Date.now();
-        const SILENCE_THRESHOLD = 5 * 60 * 1000; // 5 min (was 10)
+        const SILENCE_THRESHOLD = 20 * 60 * 1000; // 20 min — quiet sessions are normal
         const SILENCE_ESCALATE_COUNT = 3;
-        if (global._lastMsgActivity && global.waSocks) {
+        if (global.waSocks) {
             for (const [sessionKey, sock] of global.waSocks.entries()) {
                 if (!sock?.user) continue; // not connected yet
-                const lastActivity = global._lastMsgActivity.get(sessionKey) || 0;
+                // Use the later of: last message OR when socket opened
+                const lastMsg = Number(global._lastMsgActivity?.get(sessionKey) || 0);
+                const openedAt = Number(sock._openedAt || 0);
+                const lastActivity = Math.max(lastMsg, openedAt);
                 const silent = now - lastActivity;
                 if (lastActivity > 0 && silent > SILENCE_THRESHOLD) {
                     const count = (this.silentCounts.get(sessionKey) || 0) + 1;

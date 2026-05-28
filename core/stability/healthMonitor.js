@@ -36,8 +36,8 @@ const THRESHOLDS = {
     cpuCritical:    3.0,    // 300% = critical, throttle queue
 
     // Silence: if a connected session sends 0 messages this long, ping it
-    sessionSilenceMs:   5 * 60_000,   // 5 minutes
-    sessionDeadMs:      15 * 60_000,  // 15 minutes → force reconnect
+    sessionSilenceMs:   10 * 60_000,   // 10 minutes
+    sessionDeadMs:      30 * 60_000,   // 30 minutes — quiet sessions are normal, don't kill them
 
     // Response time: max tolerable delay for bot replies
     responseWarnMs:     5_000,    // 5s response is slow
@@ -162,7 +162,10 @@ async function _checkSessions() {
     for (const [sessionKey, sock] of global.waSocks.entries()) {
         if (!sock?.user) continue; // still connecting — skip
 
-        const lastActivity = global._lastMsgActivity?.get(sessionKey) || 0;
+        // Use the later of: last message OR when socket opened — prevents killing fresh sessions
+        const lastMsg = global._lastMsgActivity?.get(sessionKey) || 0;
+        const openedAt = Number(sock._openedAt || 0);
+        const lastActivity = Math.max(lastMsg, openedAt);
         const silent = lastActivity > 0 ? now - lastActivity : 0;
 
         // Ping if approaching silence threshold

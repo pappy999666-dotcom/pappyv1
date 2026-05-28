@@ -13,7 +13,7 @@
  */
 
 const { Intel } = require('../../../models');
-const { logger } = require('../../../utils');
+const logger = require('../../../../core/logger');
 
 const PAGE_SIZE = 10;
 

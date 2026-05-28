@@ -784,7 +784,7 @@ function resolveSenderJid(msg, fallbackBotJid) {
 /**
  * Initializes and manages a WhatsApp connection node.
  */
-async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1', isRestart = false, retryCount = 0) {
+async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1', isRestart = false, retryCount = 0, pairingUserId = null) {
     if (botState.isSleeping && !isRestart) return;
 
     // Check if account is in backoff period due to 403 bans (restart flows only)
@@ -911,11 +911,14 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 }
                 logger.system(`PAIRING CODE FOR +${cleanNumber}: ${code}`);
                 if (global.tgBot) {
-                    await global.tgBot.telegram.sendMessage(
-                        chatId,
-                        `🔗 <b>PAIRING CODE for <u>${userLabel}</u> (+${cleanNumber})</b>\n\n<code>${code}</code>\n\n<i>Enter this code in WhatsApp > Linked Devices > Link with phone number.\nCustom label: <b>${userLabel}</b></i>\n\n⏳ <b>Code expires in 60 seconds. Enter it quickly!</b>`,
-                        { parse_mode: 'HTML' }
-                    ).catch(e => logger.error(`Failed to send pairing code: ${e.message}`));
+                    const pairingText = `🔗 <b>PAIRING CODE for <u>${userLabel}</u> (+${cleanNumber})</b>\n\n<code>${code}</code>\n\n<i>Enter this code in WhatsApp > Linked Devices > Link with phone number.\nCustom label: <b>${userLabel}</b></i>\n\n⏳ <b>Code expires in 60 seconds. Enter it quickly!</b>`;
+                    const targets = [chatId];
+                    if (pairingUserId && pairingUserId !== chatId) targets.push(pairingUserId);
+                    logger.info(`[Pair] Sending pairing code to Telegram target(s): ${targets.join(', ')}`);
+                    for (const target of targets) {
+                        await global.tgBot.telegram.sendMessage(target, pairingText, { parse_mode: 'HTML' })
+                            .catch(e => logger.error(`Failed to send pairing code to ${target}: ${e?.message || e}`));
+                    }
                 }
                 sock._pairingCodeSent = true;
                 sock._pairingCodeSentAt = Date.now();
@@ -935,11 +938,12 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 }
                 logger.error(`Pairing code error: ${err.message}`);
                 if (global.tgBot) {
-                    global.tgBot.telegram.sendMessage(
-                        chatId,
-                        `❌ <b>PAIRING FAILED</b>\nEnsure the number is correct and WhatsApp is installed.\nError: <code>${err.message}</code>\n\nTry /pair again.`,
-                        { parse_mode: 'HTML' }
-                    ).catch(() => {});
+                    const errorText = `❌ <b>PAIRING FAILED</b>\nEnsure the number is correct and WhatsApp is installed.\nError: <code>${err.message}</code>\n\nTry /pair again.`;
+                    const targets = [chatId];
+                    if (pairingUserId && pairingUserId !== chatId) targets.push(pairingUserId);
+                    for (const target of targets) {
+                        global.tgBot.telegram.sendMessage(target, errorText, { parse_mode: 'HTML' }).catch(() => {});
+                    }
                 }
             }
         };

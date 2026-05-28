@@ -29,6 +29,18 @@ crashGuard.registerShutdown('stability-services', async () => {
 const _origLog = console.log.bind(console);
 // Do NOT override console.log — it breaks Baileys internal event handling
 
+// Suppress libsignal Bad MAC / Session error spam from stderr — these are noise,
+// handled by the Bad MAC reconnect logic in whatsapp.js
+const _origStderrWrite = process.stderr.write.bind(process.stderr);
+process.stderr.write = (chunk, encoding, cb) => {
+    const s = String(chunk || '');
+    if (s.includes('Bad MAC') || s.includes('Session error') || s.includes('Failed to decrypt') || s.includes('Closing session') || s.includes('Closing open session')) {
+        if (typeof cb === 'function') cb();
+        return true;
+    }
+    return _origStderrWrite(chunk, encoding, cb);
+};
+
 async function isBootableSessionDir(sessionsDir, folder) {
     const full = path.join(sessionsDir, folder);
     if (!fs.existsSync(full)) return false;
@@ -127,10 +139,13 @@ async function bootEliteOperator() {
         setTimeout(async () => {
             try {
                 const ai = require('./core/ai');
-                await ai.generateText('hi', 'warmup', { platform: 'whatsapp' });
+                // Use minimal prompt for warmup — avoids loading full system prompt
+                await ai.generateText('hi', 'warmup', { platform: 'whatsapp', extra: '' });
                 logger.info('[AI] Model warmed up and ready');
-            } catch {}
-        }, 3000);
+            } catch (e) {
+                logger.warn(`[AI] Warmup skipped: ${e.message}`);
+            }
+        }, 5000);
 
     } catch (error) { logger.error(`Critical Boot Failure: ${error.message}`); }
 }

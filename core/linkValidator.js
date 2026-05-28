@@ -271,12 +271,13 @@ async function validateGroupLink(code, sock = null) {
         return { valid: false, status: 'DEAD', error: 'no_group_id' };
     } catch (err) {
         const m = String(err?.message || '').toLowerCase();
-        // Rate limit / flood / socket errors — genuinely unknown, keep in Main for retry
+        // Rate limit / flood / socket errors — transient, keep in Main for retry
         const isTransient = m.includes('rate') || m.includes('429') || m.includes('too many')
             || m.includes('spam') || m.includes('flood') || m.includes('timeout')
             || m.includes('timed out') || m.includes('socket') || m.includes('connection')
             || m.includes('econn') || m.includes('etimedout') || m.includes('unavailable');
         if (isTransient) return { valid: false, status: 'PENDING', error: m };
+        // not-authorized/403/forbidden = group exists but bot can't join = DEAD
         // Everything else (not-found, gone, bad-request, expired, invalid, revoked) = DEAD
         return { valid: false, status: 'DEAD', error: m };
     }

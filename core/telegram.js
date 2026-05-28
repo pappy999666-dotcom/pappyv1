@@ -360,9 +360,8 @@ function formatTimeRemaining(ms) {
 
 function isIntelDeadLinkError(message) {
     const m = String(message || '').toLowerCase();
-    // Never purge for policy/rate/transient/network/socket conditions.
+    // Never purge for transient/network/rate conditions
     const nonDeadSignals = [
-        '403', 'forbidden', 'not-authorized', 'not authorized', 'restricted',
         'rate-overlimit', 'rate limit', '429', 'too many', 'spam',
         'timeout', 'timed out', 'validate-timeout', 'socket', 'connection',
         'temporary', 'temporarily', 'unavailable', 'disconnect', 'econn', 'etimedout',
@@ -376,6 +375,11 @@ function isIntelDeadLinkError(message) {
         m.includes('not found') ||
         m.includes('revoked') ||
         m.includes('404') ||
+        m.includes('403') ||
+        m.includes('forbidden') ||
+        m.includes('not-authorized') ||
+        m.includes('not authorized') ||
+        m.includes('restricted') ||
         m.includes('bad-request') ||
         m.includes('bad_request') ||
         m.includes('invite link is invalid') ||
@@ -2743,6 +2747,7 @@ async function startTelegram() {
         { match: 'validator_view_active_all', role: 'OWNER' },
         { match: 'validator_view_retry_all', role: 'OWNER' },
         { match: 'validator_view_request_all', role: 'OWNER' },
+        { match: /^vlist_(main|live|dead)_\d+$/, role: 'OWNER' },
         { match: /^validator_view_active_/, role: 'OWNER' },
         { match: /^validator_view_dead_/, role: 'OWNER' },
         { match: 'validator_reset_all', role: 'OWNER' },
@@ -4035,38 +4040,76 @@ async function startTelegram() {
     });
 
     // ── View lists ────────────────────────────────────────────────────────────
-    function _fmtLinkList(links, title) {
+    const VLIST_PAGE_SIZE = 25;
+
+    function _fmtLinkList(links, title, page = 0) {
         if (!links.length) return `📄 <b>${escapeHtml(title)}</b>\n\n<i>Empty.</i>`;
-        const preview = links.slice(0, 30)
-            .map((e, i) => `${i + 1}. <code>${escapeHtml(String(e.code || e))}</code>`)
+        const totalPages = Math.ceil(links.length / VLIST_PAGE_SIZE);
+        const safePage = Math.max(0, Math.min(page, totalPages - 1));
+        const start = safePage * VLIST_PAGE_SIZE;
+        const slice = links.slice(start, start + VLIST_PAGE_SIZE);
+        const preview = slice
+            .map((e, i) => `${start + i + 1}. <code>${escapeHtml(String(e.code || e))}</code>`)
             .join('\n');
-        return `📄 <b>${escapeHtml(title)}</b> (${links.length} total)\n\n${preview}${links.length > 30 ? `\n…and ${links.length - 30} more` : ''}`;
+        return `📄 <b>${escapeHtml(title)}</b>\n<i>Page ${safePage + 1}/${totalPages} • Total: ${links.length}</i>\n\n${preview}`;
+    }
+
+    function _vlistKeyboard(bucket, page, totalLinks, backCb = 'menu_validator') {
+        const totalPages = Math.ceil(totalLinks / VLIST_PAGE_SIZE);
+        const nav = [];
+        if (page > 0)              nav.push({ text: '⬅️ Prev', callback_data: `vlist_${bucket}_${page - 1}` });
+        if (page < totalPages - 1) nav.push({ text: '➡️ Next', callback_data: `vlist_${bucket}_${page + 1}` });
+        const rows = [];
+        if (nav.length) rows.push(nav);
+        // Live bucket gets a one-tap "send all back to main for revalidation" button
+        if (bucket === 'live') rows.push([{ text: '♻️ Send All Live → Main (Recertify)', callback_data: 'validator_reset_all' }]);
+        rows.push([{ text: '🔙 Back to Validator', callback_data: backCb }]);
+        return { inline_keyboard: rows };
     }
 
     bot.action('validator_view_main_all', (ctx) => {
         ctx.answerCbQuery().catch(() => {});
         const { getMainLinks } = require('./linkValidator');
-        const text = _fmtLinkList(getMainLinks(), 'Main DB — Unvalidated');
-        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator main list');
+        const links = getMainLinks();
+        const text = _fmtLinkList(links, 'Main DB — Unvalidated', 0);
+        return replyOrEditTelegramView(ctx, text, _vlistKeyboard('main', 0, links.length), 'Validator main list');
     });
 
     bot.action('validator_view_live_all', (ctx) => {
         ctx.answerCbQuery().catch(() => {});
-        const text = _fmtLinkList(getActiveLinks(), 'Live DB — Validated & Joinable');
-        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator live list');
+        const links = getActiveLinks();
+        const text = _fmtLinkList(links, 'Live DB — Validated & Joinable', 0);
+        return replyOrEditTelegramView(ctx, text, _vlistKeyboard('live', 0, links.length), 'Validator live list');
     });
 
     bot.action('validator_view_dead_all', (ctx) => {
         ctx.answerCbQuery().catch(() => {});
-        const text = _fmtLinkList(getDeadLinks(), 'Dead DB');
-        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator dead list');
+        const links = getDeadLinks();
+        const text = _fmtLinkList(links, 'Dead DB', 0);
+        return replyOrEditTelegramView(ctx, text, _vlistKeyboard('dead', 0, links.length), 'Validator dead list');
+    });
+
+    bot.action(/^vlist_(main|live|dead)_(\d+)$/, (ctx) => {
+        ctx.answerCbQuery().catch(() => {});
+        const bucket = ctx.match[1];
+        const page   = Math.max(0, parseInt(ctx.match[2], 10) || 0);
+        const { getMainLinks } = require('./linkValidator');
+        const links = bucket === 'main' ? getMainLinks()
+                    : bucket === 'live' ? getActiveLinks()
+                    : getDeadLinks();
+        const title = bucket === 'main' ? 'Main DB — Unvalidated'
+                    : bucket === 'live' ? 'Live DB — Validated & Joinable'
+                    : 'Dead DB';
+        const text = _fmtLinkList(links, title, page);
+        return replyOrEditTelegramView(ctx, text, _vlistKeyboard(bucket, page, links.length), `Validator ${bucket} list`);
     });
 
     // legacy callbacks — redirect gracefully
     bot.action('validator_view_active_all', (ctx) => {
         ctx.answerCbQuery().catch(() => {});
-        const text = _fmtLinkList(getActiveLinks(), 'Live DB — Validated & Joinable');
-        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator live list');
+        const links = getActiveLinks();
+        const text = _fmtLinkList(links, 'Live DB — Validated & Joinable', 0);
+        return replyOrEditTelegramView(ctx, text, _vlistKeyboard('live', 0, links.length), 'Validator live list');
     });
     bot.action('validator_view_retry_all', (ctx) => {
         ctx.answerCbQuery().catch(() => {});
@@ -4078,13 +4121,15 @@ async function startTelegram() {
     });
     bot.action(/^validator_view_active_(.+)$/, (ctx) => {
         ctx.answerCbQuery().catch(() => {});
-        const text = _fmtLinkList(getActiveLinks(), 'Live DB — Validated & Joinable');
-        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator live list');
+        const links = getActiveLinks();
+        const text = _fmtLinkList(links, 'Live DB — Validated & Joinable', 0);
+        return replyOrEditTelegramView(ctx, text, _vlistKeyboard('live', 0, links.length), 'Validator live list');
     });
     bot.action(/^validator_view_dead_(.+)$/, (ctx) => {
         ctx.answerCbQuery().catch(() => {});
-        const text = _fmtLinkList(getDeadLinks(), 'Dead DB');
-        return replyOrEditTelegramView(ctx, text, { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] }, 'Validator dead list');
+        const links = getDeadLinks();
+        const text = _fmtLinkList(links, 'Dead DB', 0);
+        return replyOrEditTelegramView(ctx, text, _vlistKeyboard('dead', 0, links.length), 'Validator dead list');
     });
 
     // ── Validate: Main → Live or Dead ─────────────────────────────────────────
@@ -4111,39 +4156,55 @@ async function startTelegram() {
         setImmediate(async () => {
             const stats = { live: 0, dead: 0, skipped: 0, total: mainLinks.length };
             const log = [];
+            let consecutiveTransient = 0;
+
             for (let i = 0; i < mainLinks.length; i++) {
                 const code = mainLinks[i].code;
-                const result = await validateGroupLink(code, sock).catch(() => ({ valid: false, status: 'DEAD' }));
+                const result = await validateGroupLink(code, sock).catch(() => ({ valid: false, status: 'PENDING', error: 'exception' }));
+
                 if (result.valid || result.status === 'LIVE') {
                     await markLinkLive(code, { validatedAt: Date.now(), validatedBy: phone });
                     stats.live++;
+                    consecutiveTransient = 0;
                     log.unshift(`✅ <code>${escapeHtml(code)}</code>`);
                 } else if (result.status === 'PENDING') {
-                    // Transient error (rate limit / socket) — leave in Main for retry
+                    // Transient (rate limit / socket) — leave in Main, count it
                     stats.skipped++;
-                    log.unshift(`⏳ <code>${escapeHtml(code)}</code> (retry later)`);
+                    consecutiveTransient++;
+                    log.unshift(`⏳ <code>${escapeHtml(code)}</code> (transient — retry later)`);
+                    // If WA is rate-limiting us hard, pause longer
+                    if (consecutiveTransient >= 5) {
+                        log.unshift(`⚠️ Rate-limited — pausing 30s...`);
+                        await new Promise(r => setTimeout(r, 30000));
+                        consecutiveTransient = 0;
+                    }
                 } else {
-                    // DEAD — everything non-live and non-transient goes to dead
                     await markLinkDead(code, { deadAt: Date.now(), reason: result.error || 'dead' });
                     stats.dead++;
+                    consecutiveTransient = 0;
                     log.unshift(`⚫ <code>${escapeHtml(code)}</code>`);
                 }
+
                 if (log.length > 8) log.pop();
                 if ((i + 1) % 10 === 0 || i === mainLinks.length - 1) {
                     const pct = Math.round(((i + 1) / mainLinks.length) * 100);
                     const bar = '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
                     await global.tgBot?.telegram?.editMessageText(
                         ctx.chat.id, statusMsg?.message_id, null,
-                        `🔬 <b>Validating…</b> ${bar} <b>${pct}%</b>\n📱 +${escapeHtml(phone)}\n\n✅ Live: <b>${stats.live}</b>  ⚫ Dead: <b>${stats.dead}</b>  ⏳ Retry: <b>${stats.skipped}</b>\n\n${log.slice(0, 6).join('\n')}`,
+                        `🔬 <b>Validating…</b> ${bar} <b>${pct}%</b>\n📱 +${escapeHtml(phone)}\n\n✅ Live: <b>${stats.live}</b>  ⚫ Dead: <b>${stats.dead}</b>  ⏳ Transient: <b>${stats.skipped}</b>\n\n${log.slice(0, 6).join('\n')}`,
                         { parse_mode: 'HTML' }
                     ).catch(() => {});
                 }
-                await new Promise(r => setTimeout(r, 1200 + Math.random() * 800));
+                // 2.5-4s between checks — avoids WA rate-limiting metadata calls
+                await new Promise(r => setTimeout(r, 2500 + Math.random() * 1500));
             }
             const s = getValidatorSummary();
+            const note = stats.skipped > 0
+                ? `\n\n⚠️ <b>${stats.skipped} transient</b> links left in Main — these hit WA rate limits during check. Run validator again to retry them.`
+                : '';
             await global.tgBot?.telegram?.editMessageText(
                 ctx.chat.id, statusMsg?.message_id, null,
-                `✅ <b>Validation complete</b>\n📱 +${escapeHtml(phone)}\n\n✅ Moved to Live: <b>${stats.live}</b>\n⚫ Moved to Dead: <b>${stats.dead}</b>\n⏳ Left in Main (retry): <b>${stats.skipped}</b>\n\n📥 Main: <b>${s.intake}</b>  ✅ Live: <b>${s.active}</b>  ⚫ Dead: <b>${s.dead}</b>`,
+                `✅ <b>Validation complete</b>\n📱 +${escapeHtml(phone)}\n\n✅ Moved to Live: <b>${stats.live}</b>\n⚫ Moved to Dead: <b>${stats.dead}</b>\n⏳ Left in Main (transient): <b>${stats.skipped}</b>${note}\n\n📥 Main: <b>${s.intake}</b>  ✅ Live: <b>${s.active}</b>  ⚫ Dead: <b>${s.dead}</b>`,
                 { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Validator', callback_data: 'menu_validator' }]] } }
             ).catch(() => {});
         });
@@ -4431,6 +4492,11 @@ async function startTelegram() {
         const lastManualResetAt = Number(cycle?.lastManualResetAt || 0);
         const age = startedAt ? formatIntelCycleAge(Date.now() - startedAt) : 'not started';
         const running = !!global._intelJoinWorkers?.get(sessionKey)?.running;
+        const workerStats = global._intelJoinWorkers?.get(sessionKey) || {};
+        const joined    = workerStats.joined    || 0;
+        const requested = workerStats.requested || 0;
+        const skipped   = workerStats.skipped   || 0;
+        const failed    = workerStats.failed    || 0;
         const resetMark = lastManualResetAt ? ` at ${new Date(lastManualResetAt).toISOString().replace('T', ' ').slice(0, 16)} UTC` : '—';
 
         const dailyWindowStartAt = Number(cycle?.dailyWindowStartAt || 0);
@@ -4904,6 +4970,7 @@ async function startTelegram() {
             let reconnectWaits = 0;
             let failStreak = 0;
             let rateHits = 0;
+            let restrictedStreak = 0;
             let safetyStoppedReason = '';
             let dailyAttemptedCount = Number(cycles[sessionKey].dailyAttempted || 0);
             let dailyJoinedCount = Number(cycles[sessionKey].dailyJoined || 0);
@@ -4993,7 +5060,11 @@ async function startTelegram() {
                         }
                     } else if (isIntelRestrictedError(m)) {
                         skipped++;
-                        pushLog(`🚫 Restricted: ${shortCode}`);
+                        failStreak++;
+                        // not-authorized/403 at join time = group permanently blocks this bot
+                        // Move to dead so validator won't keep serving it
+                        try { const { markLinkDead } = require('./linkValidator'); markLinkDead(code, { status: 'DEAD', source: 'join_restricted', deadAt: Date.now() }); } catch {}
+                        pushLog(`⛔ Blocked→Dead: ${shortCode}`);
                     } else if (isIntelRateLimitError(m)) {
                         rateHits++;
                         failStreak++;
@@ -9344,6 +9415,7 @@ Returns the group's public invite link if available.`;
         }
     });
 
+    return bot;
 }
 
 module.exports = { startTelegram, getMainDashboardMenu };

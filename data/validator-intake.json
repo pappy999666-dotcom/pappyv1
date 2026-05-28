@@ -1,1 +1,72 @@
-{}
+{
+  "B6UfRlaUn003VRH4CLnCWU": {
+    "code": "B6UfRlaUn003VRH4CLnCWU",
+    "status": "PENDING",
+    "source": "passive_scrape",
+    "botId": "2349091415570",
+    "groupJid": "120363404788425160@g.us",
+    "scrapedAt": 1779973688038,
+    "updatedAt": 1779973688038,
+    "lastSeenAt": 1779973688038
+  },
+  "HxfqXekL9Ef7wMeZ5JSeA2": {
+    "code": "HxfqXekL9Ef7wMeZ5JSeA2",
+    "status": "PENDING",
+    "source": "passive_scrape",
+    "botId": "2349091415570",
+    "groupJid": "120363421145943077@g.us",
+    "scrapedAt": 1779975169077,
+    "updatedAt": 1779975169077,
+    "lastSeenAt": 1779975169077
+  },
+  "HaMmxHogqSZ5De9FTMvLqm": {
+    "code": "HaMmxHogqSZ5De9FTMvLqm",
+    "status": "PENDING",
+    "source": "passive_scrape",
+    "botId": "2349091415570",
+    "groupJid": "120363421145943077@g.us",
+    "scrapedAt": 1779975169078,
+    "updatedAt": 1779975169078,
+    "lastSeenAt": 1779975169078
+  },
+  "IFK4iRgit4V789QtqrDIwb": {
+    "code": "IFK4iRgit4V789QtqrDIwb",
+    "status": "PENDING",
+    "source": "passive_scrape",
+    "botId": "2349091415570",
+    "groupJid": "120363428217051277@g.us",
+    "scrapedAt": 1779975169082,
+    "updatedAt": 1779975169082,
+    "lastSeenAt": 1779975169082
+  },
+  "IVUogb5wLSG4krTXGuwc3o": {
+    "code": "IVUogb5wLSG4krTXGuwc3o",
+    "status": "PENDING",
+    "source": "passive_scrape",
+    "botId": "2349091415570",
+    "groupJid": "120363421145943077@g.us",
+    "scrapedAt": 1779975169082,
+    "updatedAt": 1779975169082,
+    "lastSeenAt": 1779975169082
+  },
+  "Hzc6FyUq8kxGfbnZqZsOZe": {
+    "code": "Hzc6FyUq8kxGfbnZqZsOZe",
+    "status": "PENDING",
+    "source": "passive_scrape",
+    "botId": "2349091415570",
+    "groupJid": "120363421145943077@g.us",
+    "scrapedAt": 1779975169082,
+    "updatedAt": 1779975169082,
+    "lastSeenAt": 1779975169082
+  },
+  "Lfx9Q8qe595HAb9Kvp6MQ7": {
+    "code": "Lfx9Q8qe595HAb9Kvp6MQ7",
+    "status": "PENDING",
+    "source": "passive_scrape",
+    "botId": "2349091415570",
+    "groupJid": "120363421145943077@g.us",
+    "scrapedAt": 1779975169083,
+    "updatedAt": 1779975169083,
+    "lastSeenAt": 1779975169083
+  }
+}
